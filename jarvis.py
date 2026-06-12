@@ -55,8 +55,6 @@ from pathlib import Path
 from dotenv import load_dotenv
 import numpy as np
 import sounddevice as sd
-import kokoro_onnx
-import sounddevice as sd
 import soundfile as sf
 
 # --- tuning knobs -----------------------------------------------------------
