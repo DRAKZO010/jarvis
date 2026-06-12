@@ -250,7 +250,7 @@ def execute_system_action_routine(clean_input: str, user_text: str, tasks: list)
     # 1. Verification Sequence Challenge
     if "verify identity" in clean_input or "who am i" in clean_input or "reveal identity" in clean_input:
         ident = memory.get("secure_identity", {})
-        return f"Identity confirmation match verified. Operator profile parsed as {ident.get('name')}, second-year candidate specializing in {ident.get('role')} at {ident.get('institution')}. Clearance tier: {ident.get('clearance_level')}."
+        return f"Identity confirmation match verified. Operator profile parsed as {ident.get('name')}, second-year candidate specializing in {ident.get('role')} at {ident.get('institution')}. Clearance level: {ident.get('clearance_level', 'Unknown')}."
 
     # 2. Automated Custom Layout Deployments (From your script)
     elif "initialize workspace" in clean_input or "open code" in clean_input or "launch project" in clean_input or "deploy systems" in clean_input:
@@ -260,7 +260,9 @@ def execute_system_action_routine(clean_input: str, user_text: str, tasks: list)
 
     # 3. Environment Performance Telemetry
     elif "system status" in clean_input or "diagnostic check" in clean_input or "telemetry" in clean_input:
-        return f"Core engine diagnostics show processor metrics at {psutil.cpu_percent()}% with volatile memory consumption running at {psutil.virtual_memory().percent}%, Boss. Local terminal links are entirely functional."
+        cpu_usage = psutil.cpu_percent()
+        memory_usage = psutil.virtual_memory().percent
+        return f"Core engine diagnostics show processor metrics at {cpu_usage}% with volatile memory consumption running at {memory_usage}%, Boss. Local terminal link online and monitoring operational parameters."
 
     # 4. Long-Term Workflow Additions
     elif "add task" in clean_input or "log objective" in clean_input or "remind me to" in clean_input:
