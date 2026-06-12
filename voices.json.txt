@@ -1,0 +1,8 @@
+{
+  "af_heart": [0],
+  "af_bella": [1],
+  "af_nicole": [2],
+  "af_sarah": [3],
+  "am_adam": [4],
+  "am_michael": [5]
+}
