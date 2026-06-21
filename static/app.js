@@ -260,6 +260,21 @@
         }
     })();
 
+    // Window controls (frameless mode)
+    const $btnMinimize = document.getElementById("btnMinimize");
+    const $btnClose = document.getElementById("btnClose");
+    if ($btnMinimize) {
+        $btnMinimize.addEventListener("click", () => {
+            if (window.pywebview) window.pywebview.api.minimize();
+        });
+    }
+    if ($btnClose) {
+        $btnClose.addEventListener("click", () => {
+            if (window.pywebview) window.pywebview.api.close();
+            else window.close();
+        });
+    }
+
     connect();
     setUIState("standby");
 })();

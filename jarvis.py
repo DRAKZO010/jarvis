@@ -507,6 +507,10 @@ async def _run_ws_server():
 # =============================================================================
 # MAIN
 # =============================================================================
+def _run_ws_background():
+    asyncio.run(_run_ws_server())
+
+
 def main() -> int:
     print()
     print("  =========================================================")
@@ -539,20 +543,51 @@ def main() -> int:
     threading.Thread(target=_http_thread, daemon=True).start()
     log.info("HUD server on http://localhost:%d", HTTP_PORT)
 
-    # Open browser after a short delay
-    def _open_browser():
-        time.sleep(1.5)
-        webbrowser.open(f"http://localhost:{HTTP_PORT}")
-    threading.Thread(target=_open_browser, daemon=True).start()
+    # WebSocket server (in background thread so main thread can run pywebview)
+    threading.Thread(target=_run_ws_background, daemon=True).start()
 
-    # WebSocket server (runs in main thread's asyncio loop)
+    # Open native desktop window
+    time.sleep(1.0)
     try:
-        asyncio.run(_run_ws_server())
-    except KeyboardInterrupt:
-        log.info("Shutting down. Goodbye, %s.", name)
-        _speech_q.put(None)
-        return 0
+        import webview
 
+        class Api:
+            def __init__(self, window_ref):
+                self._window = window_ref
+
+            def minimize(self):
+                if self._window[0]:
+                    self._window[0].minimize()
+
+            def close(self):
+                if self._window[0]:
+                    self._window[0].destroy()
+
+        window_ref = [None]
+
+        window_ref[0] = webview.create_window(
+            "J.A.R.V.I.S.",
+            url=f"http://localhost:{HTTP_PORT}",
+            width=1280,
+            height=800,
+            frameless=True,
+            easy_drag=True,
+            on_top=True,
+            min_size=(800, 500),
+            js_api=Api(window_ref),
+        )
+        log.info("Native window opened. Say \"%s\" or type a command.", WAKE_WORD.capitalize())
+        webview.start(debug=False)
+    except ImportError:
+        log.warning("pywebview not installed. Falling back to browser.")
+        webbrowser.open(f"http://localhost:{HTTP_PORT}")
+        try:
+            asyncio.run(_run_ws_server())
+        except KeyboardInterrupt:
+            pass
+
+    log.info("Shutting down. Goodbye, %s.", name)
+    _speech_q.put(None)
     return 0
 
 
