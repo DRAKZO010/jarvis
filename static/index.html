@@ -1,179 +1,215 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>J.A.R.V.I.S.</title>
-    <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;500;600;700;900&family=Rajdhani:wght@300;400;500;600;700&family=Share+Tech+Mono&display=swap" rel="stylesheet">
-    <link rel="stylesheet" href="style.css">
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>J.A.R.V.I.S.</title>
+<!--
+  ╔══════════════════════════════════════════════════════════════╗
+  ║  HUD DESIGN — LOCKED                                        ║
+  ║  Status: FROZEN — DO NOT MODIFY                             ║
+  ║  Author: Mohammed Nabeel                                    ║
+  ║  Last Updated: 2026-06-30                                   ║
+  ║                                                             ║
+  ║  This HUD design is FINAL. Any visual/UX changes must be    ║
+  ║  approved by the creator before implementation.             ║
+  ╚══════════════════════════════════════════════════════════════╝
+-->
+<link rel="stylesheet" href="style.css">
+<link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;500;700;900&family=Rajdhani:wght@300;400;500;600;700&family=Share+Tech+Mono&display=swap" rel="stylesheet">
 </head>
 <body>
-    <!-- Background layers -->
-    <canvas id="particleCanvas"></canvas>
-    <div class="vignette"></div>
+<div id="hud">
+  <!-- Top Bar -->
+  <div id="top-bar">
+    <div class="top-left">
+      <span class="label">PROJECT</span>
+      <span class="value accent">J.A.R.V.I.S.</span>
+    </div>
+    <div class="top-center">
+      <span id="clock" class="clock">00:00:00</span>
+      <span id="date" class="date">STARK INDUSTRIES</span>
+    </div>
+    <div class="top-right">
+      <span class="label">STATUS</span>
+      <span id="system-status" class="value accent">ONLINE</span>
+    </div>
+  </div>
 
-    <div class="jarvis-ui">
-        <!-- Window Controls (frameless mode) -->
-        <div class="window-controls">
-            <button class="win-btn win-minimize" id="btnMinimize" title="Minimize">
-                <svg viewBox="0 0 12 12" width="12" height="12"><line x1="2" y1="6" x2="10" y2="6" stroke="currentColor" stroke-width="1.5"/></svg>
-            </button>
-            <button class="win-btn win-close" id="btnClose" title="Close">
-                <svg viewBox="0 0 12 12" width="12" height="12"><line x1="2" y1="2" x2="10" y2="10" stroke="currentColor" stroke-width="1.5"/><line x1="10" y1="2" x2="2" y2="10" stroke="currentColor" stroke-width="1.5"/></svg>
-            </button>
-        </div>
-
-        <!-- HUD Overlay (corner brackets) -->
-        <div class="hud-overlay">
-            <div class="corner corner-tl"></div>
-            <div class="corner corner-tr"></div>
-            <div class="corner corner-bl"></div>
-            <div class="corner corner-br"></div>
-            <div class="scan-line"></div>
-        </div>
-
-        <!-- ═══ TOP BAR ═══ -->
-        <header class="top-bar">
-            <div class="top-left">
-                <div class="arc-mark"></div>
-                <span class="logo-text">J.A.R.V.I.S.</span>
-            </div>
-            <div class="top-center">
-                <span class="sys-label" id="sysLabel">SYSTEMS NOMINAL</span>
-            </div>
-            <div class="top-right">
-                <div class="datetime">
-                    <span id="time" class="time-val">--:--:--</span>
-                    <span id="date" class="date-val">---</span>
-                </div>
-                <div class="conn-dot" id="connDot" title="Connection"></div>
-            </div>
-        </header>
-
-        <!-- ═══ MAIN HUD ═══ -->
-        <main class="hud-main">
-            <!-- Left Panel: Diagnostics -->
-            <aside class="holo-panel panel-left">
-                <div class="panel-title">DIAGNOSTICS</div>
-                <div class="panel-content">
-                    <!-- CPU -->
-                    <div class="metric-row">
-                        <div class="metric-label">CPU</div>
-                        <div class="metric-bar-track">
-                            <div class="metric-bar-fill cpu-bar" id="cpuBar"></div>
-                        </div>
-                        <div class="metric-value" id="cpuVal">0%</div>
-                    </div>
-                    <!-- RAM -->
-                    <div class="metric-row">
-                        <div class="metric-label">RAM</div>
-                        <div class="metric-bar-track">
-                            <div class="metric-bar-fill ram-bar" id="ramBar"></div>
-                        </div>
-                        <div class="metric-value" id="ramVal">0%</div>
-                    </div>
-                    <div class="metric-sub" id="ramDetail">0.0 / 0.0 GB</div>
-                    <!-- Battery -->
-                    <div class="metric-row" id="batteryRow" style="display:none;">
-                        <div class="metric-label">BATT</div>
-                        <div class="metric-bar-track">
-                            <div class="metric-bar-fill batt-bar" id="battBar"></div>
-                        </div>
-                        <div class="metric-value" id="battVal">--%</div>
-                    </div>
-                </div>
-                <!-- Status indicators -->
-                <div class="panel-divider"></div>
-                <div class="panel-title">STATUS</div>
-                <div class="panel-content status-grid">
-                    <div class="status-item">
-                        <div class="status-dot online"></div>
-                        <span>VOSK STT</span>
-                    </div>
-                    <div class="status-item">
-                        <div class="status-dot online"></div>
-                        <span>GEMINI LLM</span>
-                    </div>
-                    <div class="status-item">
-                        <div class="status-dot online"></div>
-                        <span>SAPI TTS</span>
-                    </div>
-                </div>
-            </aside>
-
-            <!-- Center: Arc Reactor -->
-            <div class="hud-center">
-                <!-- Arc Reactor SVG -->
-                <svg class="arc-reactor" viewBox="0 0 500 500" id="arcReactor">
-                    <!-- Outer ring -->
-                    <circle class="reactor-ring r-ring-1" cx="250" cy="250" r="240"/>
-                    <circle class="reactor-ring r-ring-2" cx="250" cy="250" r="228"/>
-                    <!-- Segment ring -->
-                    <circle class="reactor-ring r-ring-3" cx="250" cy="250" r="210"/>
-                    <!-- Inner decorative -->
-                    <circle class="reactor-ring r-ring-4" cx="250" cy="250" r="185"/>
-                    <circle class="reactor-ring r-ring-5" cx="250" cy="250" r="160"/>
-                    <!-- Core housing -->
-                    <circle class="reactor-ring r-ring-6" cx="250" cy="250" r="100"/>
-                    <!-- Tri-brace pattern -->
-                    <line class="brace-line" x1="250" y1="110" x2="250" y2="190"/>
-                    <line class="brace-line" x1="129" y1="315" x2="195" y2="275"/>
-                    <line class="brace-line" x1="371" y1="315" x2="305" y2="275"/>
-                    <!-- Tick marks -->
-                    <g id="tickMarks"></g>
-                    <!-- Data arcs -->
-                    <path class="data-arc da-1" d="M 250 50 A 200 200 0 0 1 450 250"/>
-                    <path class="data-arc da-2" d="M 450 250 A 200 200 0 0 1 250 450"/>
-                    <path class="data-arc da-3" d="M 250 450 A 200 200 0 0 1 50 250"/>
-                    <path class="data-arc da-4" d="M 50 250 A 200 200 0 0 1 250 50"/>
-                </svg>
-
-                <!-- Waveform canvas -->
-                <canvas id="waveCanvas" width="400" height="400"></canvas>
-
-                <!-- Core glow -->
-                <div class="core-orb" id="coreOrb">
-                    <div class="core-inner"></div>
-                </div>
-
-                <!-- Status label -->
-                <div class="reactor-status" id="statusText">INITIALIZING</div>
-            </div>
-
-            <!-- Right Panel: Communication -->
-            <aside class="holo-panel panel-right">
-                <div class="panel-title">COMMUNICATION LOG</div>
-                <div class="panel-content">
-                    <div class="conversation-log" id="conversationLog">
-                        <div class="log-msg log-system">
-                            All systems operational. Awaiting command input.
-                        </div>
-                    </div>
-                </div>
-            </aside>
-        </main>
-
-        <!-- ═══ BOTTOM BAR ═══ -->
-        <footer class="bottom-bar">
-            <div class="input-section">
-                <span class="prompt-char">></span>
-                <input type="text" id="cmdInput" placeholder="Speak or type a command..."
-                       autocomplete="off" spellcheck="false">
-                <button id="sendBtn" class="send-btn">
-                    <svg viewBox="0 0 24 24" width="16" height="16">
-                        <path d="M2 21l21-9L2 3v7l15 2-15 2z" fill="currentColor"/>
-                    </svg>
-                </button>
-            </div>
-            <div class="mic-status" id="micIndicator">
-                <div class="mic-pulse"></div>
-                <span>MIC</span>
-            </div>
-        </footer>
+  <!-- Left Panel -->
+  <div id="left-panel">
+    <!-- System Metrics -->
+    <div class="panel-section">
+      <div class="panel-header">SYSTEM METRICS</div>
+      <div class="metric-row">
+        <span class="metric-label">CPU</span>
+        <div class="metric-bar"><div id="cpu-bar" class="metric-fill" style="width:0%"></div></div>
+        <span id="cpu-val" class="metric-value">0%</span>
+      </div>
+      <div class="metric-row">
+        <span class="metric-label">RAM</span>
+        <div class="metric-bar"><div id="ram-bar" class="metric-fill" style="width:0%"></div></div>
+        <span id="ram-val" class="metric-value">0%</span>
+      </div>
+      <div class="metric-row">
+        <span class="metric-label">DSK</span>
+        <div class="metric-bar"><div id="disk-bar" class="metric-fill" style="width:0%"></div></div>
+        <span id="disk-val" class="metric-value">0%</span>
+      </div>
+      <div class="metric-row">
+        <span class="metric-label">NET</span>
+        <div class="metric-bar"><div id="net-bar" class="metric-fill" style="width:0%"></div></div>
+        <span id="net-val" class="metric-value">0 KB/s</span>
+      </div>
+      <div class="metric-row">
+        <span class="metric-label">BAT</span>
+        <div class="metric-bar"><div id="bat-bar" class="metric-fill" style="width:0%"></div></div>
+        <span id="bat-val" class="metric-value">0%</span>
+      </div>
     </div>
 
-    <script src="app.js"></script>
+    <!-- Uptime -->
+    <div class="panel-section">
+      <div class="panel-header">UPTIME</div>
+      <div id="uptime" class="big-value">00:00:00</div>
+    </div>
+
+    <!-- Process Count -->
+    <div class="panel-section">
+      <div class="panel-header">PROCESSES</div>
+      <div id="process-count" class="big-value">0</div>
+    </div>
+  </div>
+
+  <!-- Right Panel -->
+  <div id="right-panel">
+    <!-- Tasks -->
+    <div class="panel-section">
+      <div class="panel-header">TASKS</div>
+      <div id="task-list" class="scroll-list">
+        <div class="empty-text">No pending tasks</div>
+      </div>
+    </div>
+
+    <!-- Conversation -->
+    <div class="panel-section flex-grow">
+      <div class="panel-header">COMMS</div>
+      <div id="conversation" class="scroll-list">
+        <div class="empty-text">Awaiting input...</div>
+      </div>
+    </div>
+
+    <!-- Input -->
+    <div class="input-section">
+      <input type="text" id="cmd-input" placeholder="Enter command..." autocomplete="off">
+      <button id="cmd-send" class="send-btn">SEND</button>
+      <button id="mic-btn" class="mic-btn" title="Toggle microphone">
+        <svg viewBox="0 0 24 24" id="mic-icon">
+          <path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3z"/>
+          <path d="M17 11c0 2.76-2.24 5-5 5s-5-2.24-5-5H5c0 3.53 2.61 6.43 6 6.92V21h2v-3.08c3.39-.49 6-3.39 6-6.92h-2z"/>
+        </svg>
+        <span id="mic-status">MIC OFF</span>
+      </button>
+    </div>
+  </div>
+
+  <!-- Center - Arc Reactor -->
+  <div id="center">
+    <div id="arc-reactor">
+      <div class="reactor-ring ring-1"></div>
+      <div class="reactor-ring ring-2"></div>
+      <div class="reactor-ring ring-3"></div>
+      <div class="reactor-core"></div>
+      <div class="reactor-glow"></div>
+    </div>
+
+    <!-- Status Text -->
+    <div id="jarvis-status">
+      <div class="status-label">STATUS</div>
+      <div id="status-text" class="status-value">STANDBY</div>
+    </div>
+
+    <!-- Circular Metrics around reactor -->
+    <div id="circle-metrics">
+      <div class="circle-metric" style="--angle: 0deg" id="cm-cpu">
+        <svg viewBox="0 0 36 36">
+          <circle class="bg" cx="18" cy="18" r="15.9"/>
+          <circle class="fill" cx="18" cy="18" r="15.9"/>
+        </svg>
+        <span class="cm-label">CPU</span>
+        <span class="cm-value">0%</span>
+      </div>
+      <div class="circle-metric" style="--angle: 72deg" id="cm-ram">
+        <svg viewBox="0 0 36 36">
+          <circle class="bg" cx="18" cy="18" r="15.9"/>
+          <circle class="fill" cx="18" cy="18" r="15.9"/>
+        </svg>
+        <span class="cm-label">RAM</span>
+        <span class="cm-value">0%</span>
+      </div>
+      <div class="circle-metric" style="--angle: 144deg" id="cm-disk">
+        <svg viewBox="0 0 36 36">
+          <circle class="bg" cx="18" cy="18" r="15.9"/>
+          <circle class="fill" cx="18" cy="18" r="15.9"/>
+        </svg>
+        <span class="cm-label">DSK</span>
+        <span class="cm-value">0%</span>
+      </div>
+      <div class="circle-metric" style="--angle: 216deg" id="cm-net">
+        <svg viewBox="0 0 36 36">
+          <circle class="bg" cx="18" cy="18" r="15.9"/>
+          <circle class="fill" cx="18" cy="18" r="15.9"/>
+        </svg>
+        <span class="cm-label">NET</span>
+        <span class="cm-value">0 KB/s</span>
+      </div>
+      <div class="circle-metric" style="--angle: 288deg" id="cm-bat">
+        <svg viewBox="0 0 36 36">
+          <circle class="bg" cx="18" cy="18" r="15.9"/>
+          <circle class="fill" cx="18" cy="18" r="15.9"/>
+        </svg>
+        <span class="cm-label">BAT</span>
+        <span class="cm-value">0%</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- Bottom Nav -->
+  <div id="bottom-bar">
+    <button class="nav-btn" data-cmd="system info" title="System">
+      <svg viewBox="0 0 24 24"><path d="M20 18c1.1 0 2-.9 2-2V6c0-1.1-.9-2-2-2H4c-1.1 0-2 .9-2 2v10c0 1.1.9 2 2 2H0v2h24v-2h-4zM4 6h16v10H4V6z"/></svg>
+      <span>SYSTEM</span>
+    </button>
+    <button class="nav-btn" data-cmd="list tasks" title="Tasks">
+      <svg viewBox="0 0 24 24"><path d="M19 3H5c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2zm-9 14l-5-5 1.41-1.41L10 14.17l7.59-7.59L19 8l-9 9z"/></svg>
+      <span>TASKS</span>
+    </button>
+    <button class="nav-btn" data-cmd="check weather" title="Weather">
+      <svg viewBox="0 0 24 24"><path d="M6.76 4.84l-1.8-1.79-1.41 1.41 1.79 1.79 1.42-1.41zM4 10.5H1v2h3v-2zm9-9.95h-2V3.5h2V.55zm7.45 3.91l-1.41-1.41-1.79 1.79 1.41 1.41 1.79-1.79zm-3.21 13.7l1.79 1.8 1.41-1.41-1.8-1.79-1.4 1.4zM20 10.5v2h3v-2h-3zm-8-5c-3.31 0-6 2.69-6 6s2.69 6 6 6 6-2.69 6-6-2.69-6-6-6zm-1 16.95h2V19.5h-2v2.95zm-7.45-3.91l1.41 1.41 1.79-1.8-1.41-1.41-1.79 1.8z"/></svg>
+      <span>WEATHER</span>
+    </button>
+    <button class="nav-btn active" data-cmd="" title="Home">
+      <svg viewBox="0 0 24 24"><path d="M10 20v-6h4v6h5v-8h3L12 3 2 12h3v8z"/></svg>
+      <span>HOME</span>
+    </button>
+    <button class="nav-btn" data-cmd="open youtube" title="YouTube">
+      <svg viewBox="0 0 24 24"><path d="M10 15l5.19-3L10 9v6m11.56-7.83c.13.47.22 1.1.28 1.9.07.8.1 1.49.1 2.09L22 12c0 2.19-.16 3.8-.44 4.83-.25.9-.83 1.48-1.73 1.73-.47.13-1.33.22-2.65.28-1.3.07-2.49.1-3.59.1L12 19c-4.19 0-6.8-.16-7.83-.44-.9-.25-1.48-.83-1.73-1.73-.13-.47-.22-1.1-.28-1.9-.07-.8-.1-1.49-.1-2.09L2 12c0-2.19.16-3.8.44-4.83.25-.9.83-1.48 1.73-1.73.47-.13 1.33-.22 2.65-.28 1.3-.07 2.49-.1 3.59-.1L12 5c4.19 0 6.8.16 7.83.44.9.25 1.48.83 1.73 1.73z"/></svg>
+      <span>YOUTUBE</span>
+    </button>
+    <button class="nav-btn" data-cmd="open gmail" title="Gmail">
+      <svg viewBox="0 0 24 24"><path d="M20 4H4c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V6c0-1.1-.9-2-2-2zm0 4l-8 5-8-5V6l8 5 8-5v2z"/></svg>
+      <span>EMAIL</span>
+    </button>
+    <button class="nav-btn" data-cmd="search for " title="Search">
+      <svg viewBox="0 0 24 24"><path d="M15.5 14h-.79l-.28-.27C15.41 12.59 16 11.11 16 9.5 16 5.91 13.09 3 9.5 3S3 5.91 3 9.5 5.91 16 9.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19l-4.99-5zm-6 0C7.01 14 5 11.99 5 9.5S7.01 5 9.5 5 14 7.01 14 9.5 11.99 14 9.5 14z"/></svg>
+      <span>SEARCH</span>
+    </button>
+  </div>
+
+  <!-- Scanning Line -->
+  <div id="scan-line"></div>
+</div>
+
+<script src="app.js"></script>
 </body>
 </html>
