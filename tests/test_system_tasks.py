@@ -193,3 +193,48 @@ def test_fixture_redirected_away_from_the_real_store(tasks, tmp_path):
     import mcp.tasks as tasks_mod
 
     assert tasks_mod.TASKS_PATH.parent == tmp_path
+
+
+# --- process listing --------------------------------------------------------
+
+
+def test_list_processes_reports_memory_not_the_pid(monkeypatch):
+    """tasklist CSV is name,pid,session,session#,memory.
+
+    Reading the wrong field reported every process's PID labelled as kilobytes,
+    and splitting on commas truncated any figure over 999 because the memory
+    column carries thousands separators.
+    """
+    from mcp.automation import AutomationMCP
+
+    csv_out = (
+        '"System Idle Process","0","Services","0","8 K"\r\n'
+        '"Registry","212","Services","0","5,704 K"\r\n'
+        '"lsass.exe","616","Services","0","8,388 K"\r\n'
+    )
+
+    class _Result:
+        stdout = csv_out
+
+    monkeypatch.setattr(
+        "mcp.automation.subprocess.run", lambda *a, **kw: _Result()
+    )
+    out = AutomationMCP().list_processes()
+
+    assert "Registry, 5,704 K" in out
+    assert "lsass.exe, 8,388 K" in out
+    assert '"' not in out, "quotes leaked into the spoken text"
+    for pid in ("0", "212", "616"):
+        assert f", {pid} K" not in out, f"PID {pid} reported as memory"
+
+
+def test_list_processes_survives_odd_rows(monkeypatch):
+    from mcp.automation import AutomationMCP
+
+    class _Result:
+        stdout = 'not,enough,columns\r\n\r\n"a.exe","1","S","0","1 K"\r\n'
+
+    monkeypatch.setattr(
+        "mcp.automation.subprocess.run", lambda *a, **kw: _Result()
+    )
+    assert "a.exe, 1 K" in AutomationMCP().list_processes()

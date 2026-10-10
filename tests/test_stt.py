@@ -7,6 +7,7 @@ lifecycle is exercised with fakes.
 
 from __future__ import annotations
 
+import array
 import struct
 import sys
 import threading
@@ -29,6 +30,22 @@ def tone(amplitude: int, samples: int = VAD_BLOCK) -> bytes:
 
 SILENT = tone(0)
 SPEECH = tone(8000)
+
+
+def feed(seg, block, ms):
+    """Push an audio block repeatedly for a duration, returning utterances emitted.
+
+    Tests are written in milliseconds rather than block counts: the block size
+    is a detection tuning decision, and a test that counts blocks silently
+    changes meaning whenever it is retuned.
+    """
+    block_ms = seg.block_ms
+    out = []
+    for _ in range(max(1, ms // max(1, block_ms))):
+        emitted = seg.push(block)
+        if emitted is not None:
+            out.append(emitted)
+    return out
 
 
 # --- segmenter -------------------------------------------------------------
@@ -57,78 +74,110 @@ def test_silence_never_produces_an_utterance():
 
 def test_speech_followed_by_a_pause_produces_one_utterance():
     seg = UtteranceSegmenter(silence_ms=1000)
-    for _ in range(4):
-        assert seg.push(SPEECH) is None  # still talking
-    emitted = [seg.push(SILENT) for _ in range(6)]
-    assert any(e is not None for e in emitted), "pause did not end the utterance"
+    assert feed(seg, SPEECH, 600) == [], "still talking"
+    assert feed(seg, SILENT, 1200), "pause did not end the utterance"
 
 
 def test_utterance_contains_the_speech():
     seg = UtteranceSegmenter(silence_ms=500)
-    seg.push(SPEECH)
-    seg.push(SPEECH)
-    emitted = [seg.push(SILENT) for _ in range(6)]
-    out = next(e for e in emitted if e is not None)
+    feed(seg, SPEECH, 400)
+    out = feed(seg, SILENT, 800)[0]
     assert SPEECH in out
 
 
 def test_exactly_one_utterance_per_pause():
     """A long silence must not produce a burst of empty utterances."""
     seg = UtteranceSegmenter(silence_ms=500)
-    for _ in range(4):
-        seg.push(SPEECH)
-    emitted = [seg.push(SILENT) for _ in range(20)]
-    assert sum(1 for e in emitted if e is not None) == 1
+    feed(seg, SPEECH, 600)
+    assert len(feed(seg, SILENT, 4000)) == 1
 
 
 def test_two_utterances_are_reported_separately():
     seg = UtteranceSegmenter(silence_ms=500)
     emitted = []
-    for _ in range(4):
-        seg.push(SPEECH)
-    for _ in range(6):
-        if seg.push(SILENT):
-            emitted.append(1)
-    for _ in range(4):
-        seg.push(SPEECH)
-    for _ in range(6):
-        if seg.push(SILENT):
-            emitted.append(1)
+    emitted += feed(seg, SPEECH, 600)
+    emitted += feed(seg, SILENT, 1000)
+    emitted += feed(seg, SPEECH, 600)
+    emitted += feed(seg, SILENT, 1000)
     assert len(emitted) == 2, f"expected two utterances, got {len(emitted)}"
 
 
 def test_a_click_is_too_short_to_be_an_utterance():
     """min_speech_ms exists so mouse clicks and door slams are ignored."""
     seg = UtteranceSegmenter(silence_ms=500, min_speech_ms=1000)
-    seg.push(SPEECH)
-    out = None
-    for _ in range(6):
-        out = seg.push(SILENT)
-    assert out is None, "a single 250 ms block was treated as speech"
+    feed(seg, SPEECH, 200)
+    assert feed(seg, SILENT, 1500) == [], "a short click was treated as speech"
 
 
 def test_flush_returns_a_pending_utterance():
     seg = UtteranceSegmenter(silence_ms=5000)
-    for _ in range(4):
-        seg.push(SPEECH)
+    feed(seg, SPEECH, 600)
     out = seg.flush()
     assert out is not None and len(out) > 0
 
 
 def test_flush_is_idempotent():
     seg = UtteranceSegmenter()
-    for _ in range(4):
-        seg.push(SPEECH)
+    feed(seg, SPEECH, 600)
     assert seg.flush() is not None
     assert seg.flush() is None
 
 
 def test_long_utterance_is_cut_at_the_cap():
     seg = UtteranceSegmenter(silence_ms=10000, max_utterance_s=1.0)
-    out = None
-    for _ in range(12):  # 3 s of continuous speech, cap is 1 s
-        out = seg.push(SPEECH)
-    assert out is not None, "continuous speech grew unbounded"
+    # 3 s of continuous speech against a 1 s cap.
+    assert feed(seg, SPEECH, 3000), "continuous speech grew unbounded"
+
+
+def test_capture_block_is_short_enough_to_detect_speech():
+    """Regression: a 250 ms block averaged speech below the gate.
+
+    Measured on this machine at 50% input gain: a raised voice peaks at 0.0056
+    in a 32 ms frame but only 0.0019 in a 250 ms frame, against a gate of
+    0.0013. Six blocks in sixty cleared it, no utterance ever formed, and the
+    assistant heard nothing while the threshold itself was correct. Detection
+    needs a frame short enough to preserve the peaks.
+    """
+    from mcp.voice import VAD_BLOCK
+
+    assert VAD_BLOCK * 1000 // 16000 <= 50, (
+        "capture blocks must be short for speech detection; a quarter second "
+        "averages the voice together with the pauses around it")
+
+
+def test_measured_speech_clears_the_gate_at_the_capture_block_size():
+    """The level measured from hardware, fed at the size the app actually uses."""
+    from mcp.voice import VAD_BLOCK
+
+    seg = UtteranceSegmenter(block=VAD_BLOCK, threshold=0.0013, silence_ms=1000,
+                             min_speech_ms=300)
+    # 0.0019 is what this voice measured per 250 ms block; 0.0056 is the same
+    # voice measured per 32 ms frame. Either way the utterance must form.
+    for amplitude in (625, 1845):
+        seg = UtteranceSegmenter(block=VAD_BLOCK, threshold=0.0013,
+                                 silence_ms=1000, min_speech_ms=300)
+        out = feed(seg, tone(amplitude), 600)
+        out += feed(seg, SILENT, 1200)
+        assert out, f"speech at {amplitude / 32768:.5f} rms did not form an utterance"
+
+
+def test_pre_roll_survives_a_smaller_block():
+    """Shrinking the block must not clip the first syllable off.
+
+    The lead-in is specified as a duration. If it were a block count, cutting
+    the block from 250 ms to 30 ms would quietly cut the pre-roll from 500 ms to
+    60 ms and every utterance would lose its first consonant.
+    """
+    seg = UtteranceSegmenter(block=480, pre_roll_ms=500)
+    assert seg.pre_roll_blocks * seg.block_ms >= 450, (
+        f"pre-roll is only {seg.pre_roll_blocks * seg.block_ms} ms, expected ~500")
+    feed(seg, SILENT, 500)
+    out = feed(seg, SPEECH, 400)
+    out += feed(seg, SILENT, 1500)
+    if out:
+        assert out[0] is not None
+        # The lead-in audio must actually be in the emitted utterance.
+        assert len(out[0]) > 480 * 2 * 4, "the lead-in was dropped"
 
 
 def test_quiet_room_does_not_trigger():
@@ -175,6 +224,29 @@ def test_custom_wake_word():
     assert matched and command == "lock the door"
 
 
+def test_wake_word_accepts_a_list_of_names():
+    """A rename must not lock the user out: both names answer."""
+    for name in ("jarvis", "ameena"):
+        matched, command = strip_wake_word(f"{name} what time is it", "jarvis,ameena")
+        assert matched, f"{name} was not accepted"
+        assert command == "what time is it"
+
+
+def test_wake_word_list_ignores_spaces_and_blanks():
+    assert strip_wake_word("jarvis hello", " jarvis , , jarvis ")[0] is True
+    # A list of nothing but separators means "no wake word", which is the
+    # documented mode where every utterance is treated as a command.
+    assert strip_wake_word("hello there", " , , ") == (True, "hello there")
+
+
+def test_default_wake_word_is_configurable(monkeypatch):
+    monkeypatch.setenv("JARVIS_WAKE_WORD", "computer")
+    v = VoiceMCP.__new__(VoiceMCP)
+    VoiceMCP.__init__(v)
+    assert v.wake_word == "computer"
+    assert strip_wake_word("computer lock the door", v.wake_word)[1] == "lock the door"
+
+
 def test_empty_input():
     assert strip_wake_word("", "jarvis") == (False, "")
     # With no wake word configured, everything is treated as a command.
@@ -187,6 +259,9 @@ def test_empty_input():
 def voice():
     v = VoiceMCP.__new__(VoiceMCP)
     VoiceMCP.__init__(v)
+    # Pin the wake word so these tests describe behaviour, not the shipped
+    # default, which is free to change when the assistant is renamed.
+    v.wake_word = "jarvis"
     return v
 
 
@@ -542,12 +617,64 @@ def _dev(name, in_ch=1, out_ch=0):
     return {"name": name, "max_input_channels": in_ch, "max_output_channels": out_ch}
 
 
+class FakeOutputSoundDevice:
+    """A sounddevice stand-in for output selection.
+
+    ``openable`` lists the output indices that behave like a connected
+    device. Everything else raises on open, which is what Windows does to a
+    Bluetooth headset that is in the device list but not connected.
+    """
+
+    def __init__(self, devices, default=None, openable=()):
+        self._devices = devices
+        self.probed = []
+
+        class _Default:
+            def __init__(self, idx):
+                self.device = [None, idx]
+        self.default = _Default(default)
+
+        self._openable = set(openable)
+
+    def query_devices(self, idx=None):
+        if idx is None:
+            return list(self._devices)
+        return self._devices[idx]
+
+    def OutputStream(self, device=None, **kwargs):
+        self.probed.append(device)
+        if device not in self._openable:
+            raise RuntimeError("Device unavailable")
+
+        class _Stream:
+            def write(self, *a, **k):
+                pass
+
+            def start(self):
+                pass
+
+            def stop(self):
+                pass
+
+            def close(self):
+                pass
+        return _Stream()
+
+
+def _install_fake_output(monkeypatch, fake):
+    _install_sd(monkeypatch, fake)
+    return fake
+
+
 def _install_sd(monkeypatch, fake):
     import types
 
     mod = types.ModuleType("sounddevice")
     mod.query_devices = fake.query_devices
-    mod.RawInputStream = fake.RawInputStream
+    if hasattr(fake, "RawInputStream"):
+        mod.RawInputStream = fake.RawInputStream
+    if hasattr(fake, "OutputStream"):
+        mod.OutputStream = fake.OutputStream
     mod.default = fake.default
     monkeypatch.setitem(sys.modules, "sounddevice", mod)
     return mod
@@ -707,3 +834,472 @@ def test_query_devices_failure_does_not_crash(voice, monkeypatch):
             device = [None, None]
 
     assert voice._select_input_device(Broken()) is None
+
+
+# --- noise-calibrated speech gate -------------------------------------------
+#
+# Regression: the gate used to be a fixed 0.015, which sits just above the
+# ~0.013 a quiet built-in laptop microphone produces. Speech never crossed the
+# gate, so no utterance was ever closed and the assistant stayed silent. The
+# gate is now derived from the room's own noise floor.
+
+def test_quiet_microphone_level_would_have_been_ignored():
+    """The level measured on real hardware must clear the gate."""
+    from mcp.voice import VAD_MIN_THRESHOLD, VAD_WARN_THRESHOLD
+
+    # Peak RMS of speech captured from a laptop array, and of room noise.
+    quiet_speech = 0.013
+    room_noise = 0.0007
+    assert quiet_speech > VAD_MIN_THRESHOLD, "a quiet voice must clear the floor"
+    assert VAD_MIN_THRESHOLD > room_noise, "silence must stay below the gate"
+    # A quiet voice should not be above the point where the user is warned,
+    # or every normal machine would be reported as broken.
+    assert quiet_speech > VAD_WARN_THRESHOLD, (
+        "the warning threshold must sit below a quiet voice, or every normal "
+        "machine is reported as too loud"
+    )
+
+
+def _stub_blocks(voice, rms_values):
+    """Feed the calibrator a fixed sequence of block RMS values."""
+    voice._probe_input_blocks = lambda sd, device, seconds=0.0: list(rms_values)
+
+
+def test_threshold_follows_the_noise_floor(voice, monkeypatch):
+    """A noisy room raises the gate, a silent room lowers it."""
+    monkeypatch.delenv("JARVIS_VAD_THRESHOLD", raising=False)
+    fake = FakeSoundDevice([_dev("Mic")], default=0, levels={0: 0.0007})
+
+    _stub_blocks(voice, [0.0007] * 20)
+    voice._calibrate_vad(fake, 0)
+    quiet_threshold = voice.vad_threshold
+
+    _stub_blocks(voice, [0.002] * 20)
+    voice._calibrate_vad(fake, 0)
+    loud_threshold = voice.vad_threshold
+
+    assert quiet_threshold < loud_threshold
+    assert voice.speaking_threshold > voice.vad_threshold
+
+
+def test_peak_does_not_raise_the_gate(voice, monkeypatch):
+    """Regression: calibration used the peak, so one cough silenced the mic.
+
+    A single loud block during the probe window pushed the derived gate above
+    the user's own voice, which made the assistant permanently deaf. The gate
+    must follow the room, not the loudest moment in it.
+    """
+    monkeypatch.delenv("JARVIS_VAD_THRESHOLD", raising=False)
+    fake = FakeSoundDevice([_dev("Mic")], default=0, levels={0: 0.0007})
+
+    _stub_blocks(voice, [0.0007] * 20)
+    voice._calibrate_vad(fake, 0)
+    baseline = voice.vad_threshold
+
+    # Same quiet room, but a few very loud blocks are mixed into the window.
+    _stub_blocks(voice, [0.05] * 3 + [0.0007] * 20)
+    voice._calibrate_vad(fake, 0)
+
+    assert voice.vad_threshold == baseline, "one loud block moved the gate"
+
+
+def test_speech_during_calibration_is_not_mistaken_for_noise(voice, monkeypatch):
+    """Regression: the median reported the user's voice as the room.
+
+    The window is sampled while the assistant starts up, which is often while
+    the user is speaking. Half the blocks being speech must not raise the
+    gate above the voice, or calibration would silence a working microphone.
+    """
+    monkeypatch.delenv("JARVIS_VAD_THRESHOLD", raising=False)
+    fake = FakeSoundDevice([_dev("Mic")], default=0, levels={0: 0.0007})
+
+    _stub_blocks(voice, [0.0007] * 20)
+    voice._calibrate_vad(fake, 0)
+    baseline = voice.vad_threshold
+
+    # Half the window is the user talking at 0.004 rms.
+    _stub_blocks(voice, [0.0007] * 12 + [0.004] * 12)
+    voice._calibrate_vad(fake, 0)
+
+    assert voice._noise_floor < 0.001, "the voice was measured as the room"
+    assert voice.vad_threshold <= baseline * 1.5, (
+        f"gate rose to {voice.vad_threshold} from {baseline} because the user "
+        "spoke during calibration")
+
+
+def test_quiet_voice_is_admitted_on_this_hardware(voice, monkeypatch):
+    """The real measurement: room 0.0007, speech blocks 0.004.
+
+    This is the level captured from the laptop array, and it is the case the
+    old fixed 0.015 gate failed outright.
+    """
+    monkeypatch.delenv("JARVIS_VAD_THRESHOLD", raising=False)
+    fake = FakeSoundDevice([_dev("Mic")], default=0, levels={0: 0.0007})
+
+    _stub_blocks(voice, [0.0007] * 20)
+    voice._calibrate_vad(fake, 0)
+
+    room = 0.0007
+    speech_block = 0.004
+    assert voice.vad_threshold > room, "room noise would clear the gate"
+    assert voice.vad_threshold < speech_block, "a real speech block would not"
+
+
+def test_threshold_stays_inside_its_bounds(voice, monkeypatch):
+    """The gate has a floor but deliberately no ceiling.
+
+    A ceiling is what silenced this user: clamping the gate in a loud room put
+    it below the noise, so every breath was read as speech. Now the gate always
+    clears the room, and a room too loud to work in is reported instead.
+    """
+    from mcp.voice import VAD_MIN_THRESHOLD, VAD_NOISE_MULTIPLE
+
+    monkeypatch.delenv("JARVIS_VAD_THRESHOLD", raising=False)
+
+    silent = FakeSoundDevice([_dev("Mic")], default=0, levels={0: 0.00001})
+    voice._calibrate_vad(silent, 0)
+    assert voice.vad_threshold == VAD_MIN_THRESHOLD
+
+    # A tolerable room simply follows the noise.
+    fake = FakeSoundDevice([_dev("Mic")], default=0, levels={0: 0.005})
+    _stub_blocks(voice, [0.005] * 20)
+    voice._calibrate_vad(fake, 0)
+    assert voice.vad_threshold == 0.005 * VAD_NOISE_MULTIPLE
+
+    # An intolerable room raises the gate rather than clamping it.
+    _stub_blocks(voice, [0.05] * 20)
+    voice._calibrate_vad(fake, 0)
+    assert voice.vad_threshold == 0.05 * VAD_NOISE_MULTIPLE
+    assert voice.vad_threshold > 0.05
+
+
+def test_gate_admits_speech_above_the_measured_noise(voice, monkeypatch):
+    """Whatever the room, the gate must sit above the silence.
+
+    This is the invariant that matters: a gate below the measured noise reads
+    every breath as speech, so the assistant talks over itself and never
+    finishes an utterance.
+    """
+    from mcp.voice import VAD_NOISE_MULTIPLE
+
+    monkeypatch.delenv("JARVIS_VAD_THRESHOLD", raising=False)
+    fake = FakeSoundDevice([_dev("Mic")], default=0, levels={0: 0.0007})
+    for floor in (0.0, 0.0002, 0.0007, 0.001, 0.003, 0.005, 0.01, 0.05):
+        _stub_blocks(voice, [floor] * 20)
+        voice._calibrate_vad(fake, 0)
+        assert voice.vad_threshold > floor, (
+            f"gate {voice.vad_threshold} does not clear a room at {floor}")
+        if floor > 0:
+            assert voice.vad_threshold >= floor * VAD_NOISE_MULTIPLE, (
+                "the gate must hold the minimum margin over the room")
+
+
+def test_a_usable_room_keeps_speech_within_reach(voice, monkeypatch):
+    """The ordinary case: gate above the room, below the voice.
+
+    Only for a room the assistant can actually work in. A loud room is allowed
+    to give up sensitivity, but it must never be the normal outcome.
+    """
+    monkeypatch.delenv("JARVIS_VAD_THRESHOLD", raising=False)
+    fake = FakeSoundDevice([_dev("Mic")], default=0, levels={0: 0.0007})
+
+    room = 0.0007
+    speech = 0.013
+    _stub_blocks(voice, [room] * 20)
+    voice._calibrate_vad(fake, 0)
+
+    assert room < voice.vad_threshold < speech, (
+        f"gate {voice.vad_threshold} is not between the room ({room}) "
+        f"and the voice ({speech})")
+
+
+def test_loud_room_raises_the_gate_and_warns(voice, monkeypatch, caplog):
+    """When the room outgrows the cap the gate must rise, and say so.
+
+    Capping the gate below the measured noise was the original defect in this
+    fix: the assistant then heard a constant stream of noise as speech. Being
+    deaf in a loud room is recoverable and self-triggering is not.
+    """
+    from mcp.voice import VAD_WARN_THRESHOLD
+
+    monkeypatch.delenv("JARVIS_VAD_THRESHOLD", raising=False)
+    fake = FakeSoundDevice([_dev("Mic")], default=0, levels={0: 0.04})
+    _stub_blocks(voice, [0.04] * 20)
+
+    with caplog.at_level("WARNING"):
+        voice._calibrate_vad(fake, 0)
+
+    assert voice.vad_threshold > 0.04, "the gate sat below the room noise"
+    assert voice.vad_threshold > VAD_WARN_THRESHOLD
+    assert voice._vad_warning, "a room this loud must be reported to the user"
+    assert "too loud" in voice._vad_warning
+    assert any("too loud" in r.message for r in caplog.records)
+
+
+def test_a_quiet_room_warns_about_nothing(voice, monkeypatch):
+    monkeypatch.delenv("JARVIS_VAD_THRESHOLD", raising=False)
+    fake = FakeSoundDevice([_dev("Mic")], default=0, levels={0: 0.0007})
+    _stub_blocks(voice, [0.0007] * 20)
+    voice._calibrate_vad(fake, 0)
+
+    assert voice._vad_warning is None
+
+
+def test_env_override_wins(voice, monkeypatch):
+    monkeypatch.setenv("JARVIS_VAD_THRESHOLD", "0.03")
+    fake = FakeSoundDevice([_dev("Mic")], default=0, levels={0: 0.0007})
+    voice._calibrate_vad(fake, 0)
+    assert voice.vad_threshold == 0.03
+    assert voice.speaking_threshold == 0.03 * 2.0
+
+
+def test_invalid_env_override_is_ignored(voice, monkeypatch):
+    monkeypatch.setenv("JARVIS_VAD_THRESHOLD", "loud")
+    fake = FakeSoundDevice([_dev("Mic")], default=0, levels={0: 0.0007})
+    voice._calibrate_vad(fake, 0)
+    assert voice.vad_threshold != 0.0
+    assert voice.vad_threshold > 0
+
+
+def test_unmeasurable_microphone_keeps_the_default(voice, monkeypatch):
+    monkeypatch.delenv("JARVIS_VAD_THRESHOLD", raising=False)
+    voice.vad_threshold = 0.011
+    fake = FakeSoundDevice([_dev("Mic")], default=0, levels={0: 0.0007},
+                           unopenable={0})
+    voice._calibrate_vad(fake, 0)
+    assert voice.vad_threshold == 0.011
+    assert voice._noise_floor is None
+
+
+def test_health_reports_the_gate(voice):
+    """The gate belongs in the status payload, since a silent mic is otherwise invisible."""
+    status = voice.get_status()
+    assert "vad_threshold" in status
+    assert "speaking_threshold" in status
+    assert "noise_floor" in status
+
+
+def test_speaking_gate_is_higher_than_the_idle_gate(voice):
+    """Echo rejection depends on this; the assistant must not answer itself."""
+    assert voice.speaking_threshold > voice.vad_threshold
+
+
+def test_barge_in_stays_reachable_for_a_quiet_voice(voice, monkeypatch):
+    """A quiet microphone must still be able to interrupt.
+
+    Raising the gate by a large multiple makes the assistant impossible to cut
+    off on a laptop array, which is a worse failure than the occasional echo
+    getting through: the wake word already prevents echo from causing a
+    command.
+    """
+    from mcp.voice import VAD_SPEAKING_MULTIPLE
+
+    monkeypatch.delenv("JARVIS_VAD_THRESHOLD", raising=False)
+    fake = FakeSoundDevice([_dev("Mic")], default=0, levels={0: 0.0007})
+
+    _stub_blocks(voice, [0.0007] * 20)
+    voice._calibrate_vad(fake, 0)
+
+    # Peak level of a voice deliberately raised to interrupt.
+    raised_voice = 0.05
+    assert voice.speaking_threshold < raised_voice, (
+        "barge-in gate is too high to interrupt with")
+    assert VAD_SPEAKING_MULTIPLE <= 2.5, "an excessive margin blocks interruption"
+
+
+
+# -- Output device selection -----------------------------------------------
+
+def test_connected_headset_is_preferred_over_the_laptop(voice, monkeypatch):
+    """If the user is wearing earbuds, replies must go to the earbuds."""
+    monkeypatch.delenv("JARVIS_OUTPUT_DEVICE", raising=False)
+    fake = FakeOutputSoundDevice(
+        [_dev("Speakers (Realtek)", out_ch=2), _dev("Headset (Stone 358)", out_ch=2)],
+        default=0, openable={0, 1})
+    _install_fake_output(monkeypatch, fake)
+
+    assert voice._select_output_device(fake) == 1
+
+
+def test_disconnected_headset_is_never_used(voice, monkeypatch):
+    """Regression: Windows lists headsets the user is not wearing.
+
+    This machine has ten Bluetooth headsets permanently in the device list.
+    Choosing by name alone sent speech to hardware nobody was wearing, which
+    looks exactly like a broken speaker. A device must also open.
+    """
+    monkeypatch.delenv("JARVIS_OUTPUT_DEVICE", raising=False)
+    fake = FakeOutputSoundDevice(
+        [_dev("Speakers (Realtek)", out_ch=2),
+         _dev("Headset (Noise Buds VS102 Pro)", out_ch=2),
+         _dev("Headset (OPPO Enco Air2i)", out_ch=2)],
+        default=0, openable={0})
+    _install_fake_output(monkeypatch, fake)
+
+    assert voice._select_output_device(fake) is None, "spoke into a dead headset"
+
+
+def test_earbuds_are_found_among_stale_ones(voice, monkeypatch):
+    """A dead headset earlier in the list must not hide the live one."""
+    monkeypatch.delenv("JARVIS_OUTPUT_DEVICE", raising=False)
+    fake = FakeOutputSoundDevice(
+        [_dev("Speakers (Realtek)", out_ch=2),
+         _dev("Headset (Gadpro)", out_ch=2),
+         _dev("Headset (Stone 358)", out_ch=2)],
+        default=0, openable={0, 2})
+    _install_fake_output(monkeypatch, fake)
+
+    assert voice._select_output_device(fake) == 2
+
+
+def test_no_headset_means_the_system_default(voice, monkeypatch):
+    monkeypatch.delenv("JARVIS_OUTPUT_DEVICE", raising=False)
+    fake = FakeOutputSoundDevice(
+        [_dev("Speakers (Realtek)", out_ch=2), _dev("Headphones ()", out_ch=2)],
+        default=0, openable={0})
+    _install_fake_output(monkeypatch, fake)
+
+    assert voice._select_output_device(fake) is None
+
+
+def test_output_device_override_by_name(voice, monkeypatch):
+    monkeypatch.setenv("JARVIS_OUTPUT_DEVICE", "stone 358")
+    fake = FakeOutputSoundDevice(
+        [_dev("Speakers (Realtek)", out_ch=2), _dev("Headset (Stone 358)", out_ch=2)],
+        default=0, openable={0, 1})
+    _install_fake_output(monkeypatch, fake)
+
+    assert voice._select_output_device(fake) == 1
+    assert fake.probed == [], "an explicit override must not be probed"
+
+
+def test_output_device_override_by_index(voice, monkeypatch):
+    monkeypatch.setenv("JARVIS_OUTPUT_DEVICE", "1")
+    fake = FakeOutputSoundDevice(
+        [_dev("Speakers (Realtek)", out_ch=2), _dev("Speakers (Steam)", out_ch=2)],
+        default=0, openable={0})
+    _install_fake_output(monkeypatch, fake)
+
+    assert voice._select_output_device(fake) == 1
+
+
+def test_bad_output_override_falls_back_instead_of_raising(voice, monkeypatch):
+    """A typo in the setting must not silence the assistant."""
+    monkeypatch.setenv("JARVIS_OUTPUT_DEVICE", "nonexistent-speaker")
+    fake = FakeOutputSoundDevice(
+        [_dev("Speakers (Realtek)", out_ch=2)], default=0, openable={0})
+    _install_fake_output(monkeypatch, fake)
+
+    assert voice._select_output_device(fake) is None
+
+
+def test_output_choice_is_cached(voice, monkeypatch):
+    """Replying must not re-probe the whole device list every time."""
+    monkeypatch.delenv("JARVIS_OUTPUT_DEVICE", raising=False)
+    fake = FakeOutputSoundDevice(
+        [_dev("Speakers (Realtek)", out_ch=2), _dev("Headset (Stone 358)", out_ch=2)],
+        default=0, openable={0, 1})
+    _install_fake_output(monkeypatch, fake)
+
+    assert voice._select_output_device(fake) == 1
+    probed_after_first = len(fake.probed)
+    voice._select_output_device(fake)
+    voice._select_output_device(fake)
+    assert len(fake.probed) == probed_after_first, "device list re-probed"
+
+
+def test_replies_follow_earbuds_connected_later(voice, monkeypatch):
+    """Plugging in earbuds mid-session should be noticed, not require a restart."""
+    from mcp.voice import OUTPUT_RECHECK_S
+
+    monkeypatch.delenv("JARVIS_OUTPUT_DEVICE", raising=False)
+    fake = FakeOutputSoundDevice(
+        [_dev("Speakers (Realtek)", out_ch=2), _dev("Headset (Stone 358)", out_ch=2)],
+        default=0, openable={0})
+    _install_fake_output(monkeypatch, fake)
+
+    assert voice._select_output_device(fake) is None
+
+    # The earbuds arrive.
+    fake._openable.add(1)
+    voice._output_device_cached_at -= OUTPUT_RECHECK_S + 1
+
+    assert voice._select_output_device(fake) == 1
+
+
+def test_quiet_speech_is_lifted_for_the_recognizer(voice):
+    """Detection can admit a voice that is still too quiet to recognise.
+
+    On this hardware a raised voice peaks near 0.004 RMS, about -48 dBFS, and
+    Vosk returns an empty transcript for that. The gate runs on the raw signal
+    while the recognizer is given a lifted copy.
+    """
+    quiet = 0.004
+    voice._adapt_input_gain(quiet)
+    for _ in range(200):
+        voice._adapt_input_gain(quiet)
+
+    assert voice._input_gain > 1.0
+    scaled = UtteranceSegmenter.rms(voice._gain_audio(tone(1310)))
+    assert scaled > quiet, "the recognizer is still being handed a whisper"
+    assert scaled < 1.0, "the lifted audio clipped"
+
+
+def test_gain_does_not_clip_loud_audio(voice):
+    loud = 0.9
+    for _ in range(50):
+        voice._adapt_input_gain(loud)
+    samples = array.array("h")
+    samples.frombytes(voice._gain_audio(tone(29490)))
+    assert max(samples) <= 32767 and min(samples) >= -32768
+    assert UtteranceSegmenter.rms(voice._gain_audio(tone(29490))) <= 1.0
+
+
+def test_gain_is_smoothed(voice):
+    """One contrasting block must not snap the level, in either direction."""
+    from mcp.voice import VAD_AGC_MAX_GAIN
+
+    # A quiet block wants a high gain.
+    for _ in range(50):
+        voice._adapt_input_gain(0.02)
+    high = voice._input_gain
+    assert high > 2.0
+
+    # A single loud block wants unity, but must not get there instantly.
+    voice._adapt_input_gain(0.9)
+    assert high > voice._input_gain > 1.0, "the gain fell straight to unity"
+
+    # And one quiet block must not snap it back up either.
+    before = voice._input_gain
+    voice._adapt_input_gain(0.002)
+    assert before < voice._input_gain < VAD_AGC_MAX_GAIN, "the gain jumped"
+
+
+def test_gain_never_drops_below_unity(voice):
+    """Silence must not be amplified, or the AGC manufactures its own noise."""
+    for _ in range(20):
+        voice._adapt_input_gain(0.0001)
+    assert voice._input_gain >= 1.0
+
+
+def test_a_quiet_working_microphone_is_not_abandoned(voice, monkeypatch):
+    """Turning the input level down must not move JARVIS to another mic.
+
+    The dead-input cutoff is an absolute level, so a cutoff set for a desktop
+    microphone declares a laptop array dead as soon as the Windows input level
+    is turned down. The assistant then listens on a different device every time
+    the user adjusts their volume, which is baffling to debug.
+    """
+    from mcp.voice import INPUT_SILENT_RMS
+
+    monkeypatch.delenv("JARVIS_INPUT_DEVICE", raising=False)
+    quiet_but_working = 0.0003
+    assert quiet_but_working > INPUT_SILENT_RMS, (
+        "a quiet but working microphone would be treated as dead")
+
+    fake = FakeSoundDevice(
+        [_dev("Microphone Array (Realtek)"), _dev("Microsoft Sound Mapper")],
+        default=0, levels={0: quiet_but_working, 1: 0.02})
+
+    assert voice._select_input_device(fake) == 0, (
+        "abandoned a working default input for a louder one")

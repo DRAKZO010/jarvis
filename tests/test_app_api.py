@@ -350,3 +350,26 @@ def test_websocket_ptt_release_is_broadcast(client_module):
                     if states == [True, False]:
                         break
             assert states == [True, False], states
+
+
+# --- window title matching -------------------------------------------------
+
+def test_hud_window_title_matches_the_current_name(app_module):
+    """The HUD is found by its <title>, so this has to track APP_NAME.
+
+    A rename that misses this leaves the focus command unable to find the
+    window it is supposed to raise.
+    """
+    assert app_module.is_hud_window_title(f"chrome - {app_module.APP_NAME.lower()}")
+    assert app_module.is_hud_window_title("localhost:8765 - chrome")
+
+
+def test_hud_window_title_ignores_unrelated_windows(app_module):
+    assert not app_module.is_hud_window_title("notepad")
+    assert not app_module.is_hud_window_title("jarvis - notepad")
+    assert not app_module.is_hud_window_title("")
+
+
+def test_hud_window_title_still_accepts_the_legacy_name(app_module):
+    """A tab opened before a rename must keep working."""
+    assert app_module.is_hud_window_title("j.a.r.v.i.s. - chrome")

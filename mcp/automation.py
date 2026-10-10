@@ -1,6 +1,7 @@
 """Automation MCP - Full computer control, apps, file ops, system commands."""
 
 from __future__ import annotations
+import csv
 import logging
 import os
 import re
@@ -402,18 +403,20 @@ class AutomationMCP(MCPBase):
             return f"Error killing process: {e}"
 
     def list_processes(self) -> str:
-        """List running processes."""
+        """List running processes, with the memory they are actually using."""
         try:
             result = subprocess.run(
                 ["tasklist", "/FO", "CSV", "/NH"],
                 capture_output=True, text=True, timeout=10
             )
-            lines = result.stdout.strip().split("\n")
+            # tasklist CSV is name, pid, session name, session, memory. The
+            # memory column carries thousands separators, so it has to be parsed
+            # as CSV rather than split on commas: doing that reported the PID
+            # labelled as kilobytes and truncated every figure over 999.
             procs = []
-            for line in lines[:20]:
-                parts = line.split('","')
-                if len(parts) >= 2:
-                    procs.append(f"{parts[0]} - {parts[1]} KB")
+            for parts in list(csv.reader(result.stdout.splitlines()))[:20]:
+                if len(parts) >= 5 and parts[0] and parts[4]:
+                    procs.append(f"{parts[0]}, {parts[4]}")
             return "\n".join(procs) or "No processes found."
         except Exception as e:
             return f"Error listing processes: {e}"

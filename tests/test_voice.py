@@ -169,16 +169,75 @@ def test_voice_module_does_not_import_the_app():
 
 # --- configuration ---------------------------------------------------------
 
-def test_edge_voice_defaults_and_env_override(monkeypatch):
-    monkeypatch.delenv("EDGE_TTS_VOICE", raising=False)
+def test_fish_audio_is_the_only_tts_backend():
+    """Fish Audio is the sole speech backend, by design.
+
+    Guards against a fallback being reintroduced: swapping in edge-tts or sapi
+    would silently speak in a different voice than the one that was configured.
+    """
     v = VoiceMCP.__new__(VoiceMCP)
     VoiceMCP.__init__(v)
-    assert v.edge_voice, "a default Edge voice must be set so TTS can start"
+    v._fish_client = object()  # pretend Fish initialised
+    v._build_tts_chain()
+    assert v._backend_order == ["fish-audio"]
 
-    monkeypatch.setenv("EDGE_TTS_VOICE", "en-US-AriaNeural")
+
+def test_no_chain_when_fish_is_unavailable():
+    """Without a Fish client JARVIS stays silent rather than using another voice."""
+    v = VoiceMCP.__new__(VoiceMCP)
+    VoiceMCP.__init__(v)
+    v._fish_client = None
+    v._build_tts_chain()
+    assert v._backend_order == []
+
+
+def test_rebuilding_the_chain_does_not_duplicate_entries():
+    """A repeated init must not leave two copies of the backend behind."""
+    v = VoiceMCP.__new__(VoiceMCP)
+    VoiceMCP.__init__(v)
+    v._fish_client = object()
+    v._build_tts_chain()
+    v._build_tts_chain()
+    assert v._backend_order == ["fish-audio"]
+
+
+def test_fish_voice_is_configurable(monkeypatch):
+    monkeypatch.delenv("FISH_VOICE_ID", raising=False)
+    v = VoiceMCP.__new__(VoiceMCP)
+    VoiceMCP.__init__(v)
+    assert v.fish_tts_model, "a TTS model must be set so speech can start"
+
+    monkeypatch.setenv("FISH_VOICE_ID", "abc123")
     v2 = VoiceMCP.__new__(VoiceMCP)
     VoiceMCP.__init__(v2)
-    assert v2.edge_voice == "en-US-AriaNeural"
+    assert v2.fish_voice_id == "abc123"
+
+
+# --- the one backend, reported honestly -------------------------------------
+
+def test_backend_report_names_fish(voice):
+    voice._backend_order = ["fish-audio"]
+    assert "fish" in voice.handle("voice backend", "").lower()
+
+
+def test_backend_report_refuses_a_backend_that_was_removed(voice):
+    """Asking for a deleted backend must be answered, not silently ignored."""
+    voice._backend_order = ["fish-audio"]
+    reply = voice.handle("voice backend", "edge")
+    assert "edge" in reply.lower()
+    assert "fish" in reply.lower()
+
+
+def test_backend_report_admits_it_when_silent(voice):
+    voice._backend_order = []
+    assert "unavailable" in voice.handle("voice backend", "").lower()
+
+
+def test_list_voices_does_not_mention_a_removed_backend(voice):
+    voice._active_backend = "fish-audio"
+    reply = voice.handle("list voices", "")
+    assert "edge" not in reply.lower()
+    assert "fish" in reply.lower()
 
 
 def test_interrupt_debounce_never_blocks_an_active_stop(voice):

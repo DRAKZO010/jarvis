@@ -1,5 +1,5 @@
 /* =============================================================================
-   J.A.R.V.I.S. IRON MAN HUD - APP
+   Jarvis HUD - APP
    ============================================================================= */
 
 (function () {
@@ -127,7 +127,7 @@
 
     const div = document.createElement("div");
     div.className = `conv-msg ${speaker}`;
-    div.innerHTML = `<div class="speaker ${speaker}">${speaker === "user" ? "YOU" : "J.A.R.V.I.S."}</div><div class="text">${escapeHtml(text)}</div>`;
+    div.innerHTML = `<div class="speaker ${speaker}">${speaker === "user" ? "YOU" : "Jarvis"}</div><div class="text">${escapeHtml(text)}</div>`;
     conversation.appendChild(div);
     conversation.scrollTop = conversation.scrollHeight;
 

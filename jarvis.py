@@ -1,4 +1,4 @@
-"""J.A.R.V.I.S. - AI Personal Assistant
+"""Jarvis - AI Personal Assistant
 Main entry point with WebSocket server and command processing.
 """
 from __future__ import annotations
@@ -26,6 +26,7 @@ from mcp import (
     ContextMCP, RemindersMCP, FilesMCP, NewsMCP,
 )
 from mcp import voice as voice_module
+from mcp.capabilities import build_routing_prompt, is_routable
 
 from fastapi import FastAPI, WebSocket
 from fastapi.responses import HTMLResponse, FileResponse, JSONResponse, Response
@@ -41,7 +42,7 @@ except Exception:
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-APP_NAME = "J.A.R.V.I.S."
+APP_NAME = "Jarvis"
 VERSION = "1.1.0"
 MIN_COMMAND_LEN = 3
 HOST = "127.0.0.1"
@@ -235,17 +236,75 @@ def _speak_stream_broadcast(generator_func, *args) -> None:
         speak("I encountered an error, sir.")
 
 
+# How long an action gets to produce its own answer before it is announced as
+# pending instead. A report answers in milliseconds and the answer is the useful
+# part, so announcing first would bury it; opening an app takes seconds and
+# needs the acknowledgement straight away.
+ACTION_ANSWER_GRACE_S = 0.6
+
+# Reports can be long - thirty window titles, twenty processes. Reading all of it
+# aloud is worse than useless, so the spoken result is capped. The HUD receives
+# the full text regardless.
+ACTION_RESULT_MAX_CHARS = 400
+
+
 def _speak_during_act(func, speak_text: str, *args) -> None:
-    """Start action and speech at the SAME time. Both non-blocking."""
-    def _do():
+    """Start action and speech at the SAME time. Both non-blocking.
+
+    The action's own return value is spoken as well. Most of the actions routed
+    through here are reports - system status, task and window lists, the
+    clipboard - and discarding what they returned meant the user heard "Checking
+    system status..." and never the answer, which was the only part that said
+    anything.
+    """
+    lock = threading.Lock()
+    spoken = {"result": False, "ack": False}
+
+    def _ack_once() -> None:
+        with lock:
+            if spoken["ack"]:
+                return
+            spoken["ack"] = True
+        speak(speak_text)
+
+    def _speak_result(result) -> None:
+        text = result.strip() if isinstance(result, str) else ""
+        if not text:
+            _ack_once()
+            return
+        with lock:
+            if spoken["result"]:
+                return
+            spoken["result"] = True
+        if len(text) > ACTION_RESULT_MAX_CHARS:
+            text = text[:ACTION_RESULT_MAX_CHARS].rstrip() + "... sir, that is the summary."
+        speak(text)
+
+    def _do() -> None:
         try:
-            func(*args)
+            result = func(*args)
         except Exception as e:
             log.error("Action error: %s", e)
             _record_error(e, getattr(func, "__name__", "action"))
             _try_self_heal(str(e), getattr(func, "__name__", "action"))
+            _ack_once()
+            return
+        _speak_result(result)
+
+    def _announce_if_slow() -> None:
+        """Acknowledge an action that is still running when the grace period ends.
+
+        Yields to a result that has already been spoken, so a fast report is not
+        announced after the fact.
+        """
+        time.sleep(ACTION_ANSWER_GRACE_S)
+        with lock:
+            if spoken["result"]:
+                return
+        _ack_once()
+
     threading.Thread(target=_do, daemon=True).start()
-    speak(speak_text)
+    threading.Thread(target=_announce_if_slow, daemon=True).start()
 
 
 def _task_action(func, speak_text: str, *args) -> None:
@@ -339,7 +398,7 @@ def _clean_news(raw: str) -> str:
         if item == 'Google News':
             continue
         # Remove trailing source suffixes
-        item = re.sub(r'\s*[-â€“]\s*(BBC|CNN|ESPN|The Guardian|The New York Times|FOX|FOX Sports|Yahoo Sports|Yahoo|USA Today|AP|Reuters|Sky Sports|Audacy)\s*$', '', item)
+        item = re.sub(r'\s*[-\u2013]\s*(BBC|CNN|ESPN|The Guardian|The New York Times|FOX|FOX Sports|Yahoo Sports|Yahoo|USA Today|AP|Reuters|Sky Sports|Audacy)\s*$', '', item)
         # Remove headline artifacts
         item = re.sub(r'\bLIVE:\s*', '', item, flags=re.IGNORECASE)
         item = re.sub(r'as it happened', '', item, flags=re.IGNORECASE)
@@ -387,6 +446,21 @@ def _fetch_and_respond(fetch_type: str, payload: str) -> None:
     except Exception as e:
         log.error("Background fetch error: %s", e)
         speak("I encountered an error fetching that data, sir.")
+
+
+def is_hud_window_title(title: str) -> bool:
+    """True when a browser window title looks like the HUD.
+
+    The HUD is served from index.html, whose <title> is the assistant's name,
+    so this has to track APP_NAME. The legacy name is still accepted so a
+    tab opened before a rename keeps working, and the dev-server hostnames
+    cover a page loaded before the title was set.
+    """
+    lowered = title.lower()
+    if "chrome" not in lowered:
+        return False
+    return any(marker in lowered for marker in
+               ("jarvis", "j.a.r.v.i.s", "localhost", "127.0.0.1"))
 
 
 def _ask_llm_stream(cmd: str, memory: dict):
@@ -511,7 +585,7 @@ COMMON_WORDS = {
     'up', 'down', 'back', 'away', 'forward',
     'please', 'could', 'set', 'it', 'also', 'much', 'well', 'right', 'now',
     'go', 'open', 'play', 'pause', 'stop', 'start', 'run', 'make', 'turn', 'say',
-    'browser', 'jarvis', 'dashboard', 'page', 'tab', 'window',
+    'browser', 'jarvis', 'ameena', 'dashboard', 'page', 'tab', 'window',
     'cost', 'trip', 'road', 'price', 'many', 'about', 'know',
     'like', 'want', 'tell', 'give', 'show', 'find', 'search', 'two',
     '0', '1', '2', '3', '4', '5', '6', '7', '8', '9',
@@ -634,10 +708,10 @@ _ACTION_PATTERNS = [
     # Greetings - flexible
     (r"^(?:good\s*(?:morning|afternoon|evening|night)|hello|hi|hey|greetings|sup|yo|howdy)$", "greeting"),
     (r"^(?:hello|hi|hey|yo)\s+(?:jarvis|sir|there)$", "greeting"),
-    (r"^jarvis\s+(?:are\s+you\s+)?(?:up|there|awake|alive|online|ready|working)$", "greeting"),
-    (r"^jarvis\s+(?:hello|hi|hey)$", "greeting"),
+    (r"^(?:jarvis)\s+(?:are\s+you\s+)?(?:up|there|awake|alive|online|ready|working)$", "greeting"),
+    (r"^(?:jarvis)\s+(?:hello|hi|hey)$", "greeting"),
     (r"^(?:how(?:'s| is) (?:it going|everything|you doing)|how are you|how do you do|you doing (?:okay|good|well|alright))$", "greeting"),
-    (r"^jarvis\s+how(?:'s| is) (?:it going|everything|you doing)$", "greeting"),
+    (r"^(?:jarvis)\s+how(?:'s| is) (?:it going|everything|you doing)$", "greeting"),
     (r"^what(?:'s|\s+is)\s+(?:up|going\s+on|happening)$", "greeting"),
     (r"^(?:thank(?:s|\s?you)|thx|ty|cheers|appreciate)$", "thanks"),
     (r"^(?:who are you|about you|your(?:s|self)?|what are you)$", "about"),
@@ -867,9 +941,9 @@ _ACTION_PATTERNS = [
     # Back to Jarvis variations
     (r"^(?:go\s+)?back\s+(?:to\s+)?(?:the\s+)?(?:browser|jarvis|dashboard|ui|frontend|interface|tab|page|window)$", "focus_jarvis"),
     (r"^(?:switch|focus)\s+(?:to\s+)?(?:the\s+)?(?:browser|jarvis|dashboard|tab|page)$", "focus_jarvis"),
-    (r"^jarvis$", "focus_jarvis"),
-    (r"^hey\s+jarvis$", "focus_jarvis"),
-    (r"^hi\s+jarvis$", "focus_jarvis"),
+    (r"^(?:jarvis)$", "focus_jarvis"),
+    (r"^hey\s+(?:jarvis)$", "focus_jarvis"),
+    (r"^hi\s+(?:jarvis)$", "focus_jarvis"),
     # Self-healing
     (r"^(?:can\s+you\s+)?(?:please\s+)?fix\s+(?:the\s+)?(?:last\s+)?error$", "fix_error"),
     (r"^heal$", "fix_error"),
@@ -883,8 +957,10 @@ _ACTION_PATTERNS = [
     # pause the music, so it belongs to the voice controls.
     (r"^(?:shut\s+up|be\s+quiet|quiet|hush|silence)$", "voice_mute"),
     (r"^voice\s+backend$", "voice_backend"),
-    (r"^set\s+voice\s+backend\s+(.+)$", "voice_backend_set"),
-    (r"^voice\s+backend\s+(.+)$", "voice_backend_set"),
+    # "set voice backend X" is answered rather than dispatched as a switch:
+    # there is only one backend, so the useful reply is that X is not one.
+    (r"^set\s+voice\s+backend\s+(.+)$", "voice_backend"),
+    (r"^voice\s+backend\s+(.+)$", "voice_backend"),
     # "set voice ryan" selects a TTS voice. Declared after the backend rules
     # so "set voice backend fish" is not read as a voice named "backend fish".
     (r"^set\s+voice\s+(.+)$", "set_voice"),
@@ -898,34 +974,113 @@ _ACTION_PATTERNS = [
 ACTION_MAP = {name: regex for regex, name in _ACTION_PATTERNS}
 ACTION_NAMES = list(dict.fromkeys(name for _, name in _ACTION_PATTERNS))
 
+# Utterance -> routing decision, so a repeated phrase does not spend another
+# LLM request. The free tier is a small daily budget, not a per-minute one.
+_ROUTE_CACHE: dict[str, tuple[str, str]] = {}
+_ROUTE_CACHE_MAX = 200
+
+
+def _extract_route_json(response: str) -> Optional[dict]:
+    """Pull the routing decision out of a model response.
+
+    The model is asked for JSON only, but it may still wrap it in a code fence
+    or add a sentence of prose, so the first object in the text is taken and
+    parsed defensively. Anything unparseable returns None and the caller falls
+    back to conversation.
+    """
+    text = response.strip()
+    if not text:
+        return None
+    fence = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
+    if fence:
+        text = fence.group(1)
+    else:
+        start = text.find("{")
+        end = text.rfind("}")
+        if start < 0 or end <= start:
+            return None
+        text = text[start:end + 1]
+    try:
+        data = json.loads(text)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+# Leading words that mark an utterance as a question rather than a command.
+_QUESTION_OPENERS = frozenset({
+    "what", "why", "how", "who", "whom", "whose", "when", "where", "which",
+    "is", "are", "was", "were", "do", "does", "did", "am",
+    "can", "could", "should", "would", "will", "shall", "may", "might",
+    "tell", "explain", "describe", "give", "know", "think", "guess",
+})
+
+
+def _looks_like_question(lower: str) -> bool:
+    """True when an utterance is plainly a question, not a command.
+
+    This only runs after the pattern table and typo repair have both failed,
+    so a real command has already been caught and a false positive here just
+    sends the phrase to conversation instead of routing. That trade is worth
+    it: skipping the routing request halves the daily quota spent on questions.
+    """
+    text = lower.strip().rstrip("?!.").strip()
+    if not text:
+        return False
+    first = text.split(maxsplit=1)[0].strip("\"'")
+    return first in _QUESTION_OPENERS
+
 
 def _llm_parse_command(cmd: str) -> Optional[tuple[str, str]]:
-    """Use the LLM to map free-form language onto a real action."""
+    """Use the LLM to map free-form language onto a real action.
+
+    This is the last step of ``_detect_action`` and only runs when the pattern
+    table and fuzzy repair both miss, so ordinary commands stay fast and free.
+    The model chooses from the described catalogue in ``mcp.capabilities``
+    rather than from bare action names, and its choice is checked against the
+    deny-by-default allowlist: an action the model is not permitted to select
+    is dropped and the utterance becomes conversation instead.
+    """
+    # The free Gemini tier allows only 20 requests per day, and a routing
+    # decision is stable for a given utterance, so repeat phrases are served
+    # from memory instead of spending quota.
+    key = " ".join(cmd.lower().split())
+    cached = _ROUTE_CACHE.get(key)
+    if cached is not None:
+        log.debug("LLM parse: cache hit for '%s' -> %s", key, cached[0])
+        return cached
+
     try:
-        prompt = (
-            'Return ONLY JSON: {"action":"name","payload":"value"}\n'
-            f"Valid actions: {', '.join(ACTION_NAMES)}\n"
-            "Rules:\n"
-            "- Use 'chat' for questions, opinions, and anything informational.\n"
-            "- Use 'search' only when the user explicitly wants a web search.\n"
-            "- Use 'news' for current events, 'weather' for forecasts.\n"
-            "- Put any extra words (search terms, app names, times) in payload.\n"
-            "- Use an empty payload when the action needs none.\n"
-            f'User: "{cmd}"'
+        prompt = build_routing_prompt(cmd)
+        response = llm_mcp.ask(
+            prompt,
+            use_history=False,
+            skip_cooldown=True,
+            temperature=0.0,
+            purpose="route",
         )
-        response = llm_mcp.ask(prompt, use_history=False, skip_cooldown=True)
-        start = response.find("{")
-        end = response.rfind("}") + 1
-        if start < 0 or end <= start:
-            log.debug("LLM parse: no JSON in response")
+        data = _extract_route_json(response)
+        if data is None:
+            log.debug("LLM parse: no usable JSON in response")
             return None
-        data = json.loads(response[start:end])
+
         action = str(data.get("action", "")).strip()
         payload = str(data.get("payload", "")).strip()
-        if action in ACTION_NAMES:
-            log.info("LLM parsed: '%s' -> action=%s, payload=%s", cmd, action, payload)
-            return action, payload
-        log.info("LLM returned unknown action %r, ignoring", action)
+
+        if not is_routable(action):
+            if action in ACTION_NAMES:
+                log.warning(
+                    "LLM chose non-routable action %r, falling back to chat", action
+                )
+            else:
+                log.info("LLM returned unknown action %r, ignoring", action)
+            return None
+
+        log.info("LLM parsed: '%s' -> action=%s, payload=%s", cmd, action, payload)
+        if len(_ROUTE_CACHE) >= _ROUTE_CACHE_MAX:
+            _ROUTE_CACHE.pop(next(iter(_ROUTE_CACHE)), None)
+        _ROUTE_CACHE[key] = (action, payload)
+        return action, payload
     except Exception as e:
         log.error("LLM parse error: %s", e)
     return None
@@ -975,6 +1130,14 @@ def _detect_action(cmd: str) -> Optional[tuple[str, str]]:
         log.info("Fuzzy match '%s' -> '%s' rejected as untrustworthy", lower, corrected)
 
     # 3. Ask the LLM to map free-form language onto an action.
+    #    A question is not a candidate for an action, and the Gemini free tier
+    #    only allows 20 requests a day, so spending one to be told "chat" and
+    #    then another to answer it doubles the cost of every question. Anything
+    #    that reads as a question goes straight to the conversational path.
+    if _looks_like_question(lower):
+        log.debug("'%s' reads as a question, skipping the routing request", lower)
+        return ("chat", cmd)
+
     result = _llm_parse_command(lower)
     if result:
         return result
@@ -1077,7 +1240,7 @@ def _handle_command_inner(cmd: str, memory: dict) -> None:
             ]))
             return
         elif action_type == "about":
-            speak("I am J.A.R.V.I.S., your personal AI assistant. Created to make your life easier, sir.")
+            speak(f"I am {APP_NAME}, your personal AI assistant. Created to make your life easier, sir.")
             return
         elif action_type == "chat":
             # Stream LLM response to speech + UI for zero-latency feel
@@ -1127,15 +1290,17 @@ JARVIS:"""
 
         # Actions - speak FIRST, action runs in background
         elif action_type == "focus_jarvis":
-            # Switch focus to JARVIS tab in Chrome
+            # Switch focus to the HUD tab in Chrome
             def _focus_jarvis():
                 import win32gui
                 import win32con
-                # Find Chrome window with JARVIS
+                # Find the Chrome window showing the HUD. Match the title
+                # (index.html <title>) as well as the dev-server hostnames,
+                # since the title follows APP_NAME.
                 def enum_callback(hwnd, results):
                     if win32gui.IsWindowVisible(hwnd):
                         title = win32gui.GetWindowText(hwnd).lower()
-                        if 'chrome' in title and ('jarvis' in title or 'j.a.r.v.i.s' in title or 'localhost' in title or '127.0.0.1' in title):
+                        if is_hud_window_title(title):
                             results.append(hwnd)
                 windows = []
                 win32gui.EnumWindows(enum_callback, windows)
@@ -1144,9 +1309,9 @@ JARVIS:"""
                     if win32gui.IsIconic(hwnd):
                         win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
                     win32gui.SetForegroundWindow(hwnd)
-                    log.info("Focused JARVIS window")
+                    log.info("Focused %s window", APP_NAME)
                 else:
-                    log.info("JARVIS window not found, trying any Chrome window")
+                    log.info("%s window not found, trying any Chrome window", APP_NAME)
                     # Fallback: focus any Chrome window
                     def enum_chrome(hwnd, results):
                         if win32gui.IsWindowVisible(hwnd):
@@ -1491,10 +1656,7 @@ JARVIS:"""
             _speak_during_act(voice_mcp.handle, "Voice unmuted.", "voice unmute", "")
             return
         elif action_type == "voice_backend":
-            _speak_during_act(voice_mcp.handle, "Checking voice backend.", "voice backend", "")
-            return
-        elif action_type == "voice_backend_set":
-            _speak_during_act(voice_mcp.handle, f"Setting voice backend to {payload}.", "voice backend", payload)
+            _speak_during_act(voice_mcp.handle, "Checking voice backend.", "voice backend", payload)
             return
         elif action_type == "list_voices":
             _speak_during_act(voice_mcp.handle, "Listing available voices.", "list voices", "")
@@ -1537,7 +1699,7 @@ async def root():
     if not index.is_file():
         log.error("HUD missing at %s", index)
         return HTMLResponse(
-            "<h1>J.A.R.V.I.S.</h1><p>static/index.html is missing.</p>",
+            f"<h1>{APP_NAME}</h1><p>static/index.html is missing.</p>",
             status_code=500,
         )
     return FileResponse(str(index))

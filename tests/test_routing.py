@@ -144,7 +144,7 @@ CASES = [
     ("list voices", "list_voices", None),
     ("set voice ryan", "set_voice", "ryan"),
     ("voice backend", "voice_backend", None),
-    ("set voice backend fish", "voice_backend_set", "fish"),
+    ("set voice backend fish", "voice_backend", "fish"),
 
     # --- directory listing, without swallowing "list windows"/"list voices" ---
     ("list directory", "list_directory", None),

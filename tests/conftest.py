@@ -54,12 +54,14 @@ def reset_app_timers(request):
 
     import jarvis
 
+    jarvis._ROUTE_CACHE.clear()
     jarvis._last_spoken_at = 0.0
     jarvis._last_command = ("", 0.0)
     jarvis._last_error = None
     yield
     jarvis._last_spoken_at = 0.0
     jarvis._last_command = ("", 0.0)
+    jarvis._ROUTE_CACHE.clear()
 
 
 @pytest.fixture
