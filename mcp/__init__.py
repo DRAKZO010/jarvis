@@ -18,6 +18,11 @@ from .context import ContextMCP
 from .reminders import RemindersMCP
 from .files import FilesMCP
 from .news import NewsMCP
+from .evolver import EvolutionMCP
+from .loop_guard import LoopGuard, LoopGuardConfig, LoopVerdict
+from .skills import SkillManager, SkillManifest, SkillStep, SkillParser
+from .memory_extractor import FactExtractor
+from .apply_patch import apply_patch_file, parse_patch
 
 __all__ = [
     "MCPBase",
@@ -33,4 +38,15 @@ __all__ = [
     "RemindersMCP",
     "FilesMCP",
     "NewsMCP",
+    "EvolutionMCP",
+    "LoopGuard",
+    "LoopGuardConfig",
+    "LoopVerdict",
+    "SkillManager",
+    "SkillManifest",
+    "SkillStep",
+    "SkillParser",
+    "FactExtractor",
+    "apply_patch_file",
+    "parse_patch",
 ]

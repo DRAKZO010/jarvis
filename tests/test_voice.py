@@ -247,3 +247,76 @@ def test_interrupt_debounce_never_blocks_an_active_stop(voice):
     voice.interrupt()
     assert voice._stop_playback.is_set()
     assert not voice._is_speaking
+
+
+# --- output gain ----------------------------------------------------------
+
+def test_tts_gain_defaults_to_unity(monkeypatch):
+    monkeypatch.delenv("JARVIS_TTS_GAIN", raising=False)
+    assert VoiceMCP._read_tts_gain() == 1.0
+
+
+def test_tts_gain_reads_the_configured_value(monkeypatch):
+    monkeypatch.setenv("JARVIS_TTS_GAIN", "2.5")
+    assert VoiceMCP._read_tts_gain() == 2.5
+
+
+def test_tts_gain_falls_back_on_garbage(monkeypatch):
+    monkeypatch.setenv("JARVIS_TTS_GAIN", "loud")
+    assert VoiceMCP._read_tts_gain() == 1.0
+
+
+@pytest.mark.parametrize("raw,expected", [("-4", 0.1), ("50", 10.0)])
+def test_tts_gain_is_clamped_to_a_safe_range(monkeypatch, raw, expected):
+    monkeypatch.setenv("JARVIS_TTS_GAIN", raw)
+    assert VoiceMCP._read_tts_gain() == expected
+
+
+def test_playback_scales_and_clips_the_samples(voice, monkeypatch, tmp_path):
+    """Gain is applied to the float samples and clipped to [-1, 1]."""
+    import sys
+    import types
+
+    import numpy as np
+
+    samples = np.array([0.2, -0.2, 0.8], dtype="float32")
+    played = {}
+
+    fake_sf = types.SimpleNamespace(
+        read=lambda path, dtype=None: (samples.copy(), 16000))
+
+    class Stream:
+        active = False
+
+    fake_sd = types.SimpleNamespace(
+        play=lambda data, sr, device=None: played.update(data=data),
+        get_stream=lambda: Stream(),
+        stop=lambda: None,
+    )
+
+    monkeypatch.setitem(sys.modules, "soundfile", fake_sf)
+    monkeypatch.setitem(sys.modules, "sounddevice", fake_sd)
+    monkeypatch.setattr(voice, "_select_output_device", lambda sd: None)
+    voice.tts_gain = 2.0
+
+    assert voice._play_mci(str(tmp_path / "reply.mp3")) is True
+    assert played["data"].tolist() == pytest.approx([0.4, -0.4, 1.0])
+
+
+def test_hands_free_output_device_is_never_chosen(voice, monkeypatch):
+    """A Bluetooth telephony endpoint opens fine but is quiet and tinny."""
+    import types
+
+    monkeypatch.delenv("JARVIS_OUTPUT_DEVICE", raising=False)
+    by_idx = {
+        30: {"name": "Headset (Hands-Free AG Audio)"},
+        5: {"name": "Headphones (CMF Buds 2a)"},
+    }
+    fake_sd = types.SimpleNamespace(query_devices=lambda idx: by_idx[idx])
+    monkeypatch.setattr(voice, "_output_devices",
+                        lambda sd: list(by_idx.items()))
+    monkeypatch.setattr(voice, "_output_device_opens", lambda sd, idx: True)
+    voice._output_device_cache = None
+
+    assert voice._select_output_device(fake_sd) == 5
+

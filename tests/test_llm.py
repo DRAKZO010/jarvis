@@ -6,9 +6,11 @@ network call, API key, or credit is required.
 
 from __future__ import annotations
 
+import tempfile
 import time
 import types
 from datetime import datetime, timedelta
+from pathlib import Path
 
 import pytest
 
@@ -96,6 +98,10 @@ def llm(monkeypatch):
     )
     m._last_call = 0.0
     m._penalty_until = 0.0
+    m._budget_path = Path(tempfile.gettempdir()) / "jarvis_llm_budget_test.json"
+    m._exhausted_until = {}
+    m._daily_spend = {}
+    m._spend_day = None
     return m
 
 
@@ -326,6 +332,10 @@ def chained_llm(monkeypatch):
     m.initialize()
     m._last_call = 0.0
     m._penalty_until = 0.0
+    m._budget_path = Path(tempfile.gettempdir()) / "jarvis_llm_budget_test.json"
+    m._exhausted_until = {}
+    m._daily_spend = {}
+    m._spend_day = None
     return m
 
 
@@ -499,3 +509,102 @@ def test_status_names_the_model_that_answered(chained_llm):
     assert status["active_model"] == "second-model"
     assert status["available"] is True, "a working model keeps the core available"
     assert status["exhausted_models"] == ["primary-model"]
+
+
+# --- transient provider failures --------------------------------------------
+
+TRANSIENT_503 = (
+    "Error code: 503 - {'error': {'code': 503, 'message': 'The model is "
+    "overloaded. Please try again later.', 'status': 'UNAVAILABLE'}}"
+)
+TRANSIENT_TIMEOUT = "Request timed out."
+
+
+def test_busy_model_falls_back_to_the_next_model(chained_llm):
+    """A 503 means the provider is busy, not that the model is spent."""
+    fake = _swap_models(chained_llm, {
+        "primary-model": Exception(TRANSIENT_503),
+        "second-model": "answer from the fallback",
+    })
+    assert chained_llm.ask("ping") == "answer from the fallback"
+    assert fake.tried == ["primary-model", "second-model"]
+    assert chained_llm._exhausted_until == {}, "a busy model is not spent"
+    assert chained_llm._unusable == set()
+    assert chained_llm._penalty_until == 0.0, "a busy model is not rate limited"
+
+
+def test_timeout_falls_back_on_the_streaming_path(chained_llm):
+    fake = _swap_models(chained_llm, {
+        "primary-model": Exception(TRANSIENT_TIMEOUT),
+        "second-model": "streamed fallback",
+    })
+    assert "".join(chained_llm.ask_stream("ping")) == "streamed fallback"
+    assert fake.tried == ["primary-model", "second-model"]
+
+
+def test_every_model_busy_is_reported_as_overload(chained_llm):
+    _swap_models(chained_llm, {
+        "primary-model": Exception(TRANSIENT_503),
+        "second-model": Exception(TRANSIENT_503),
+        "third-model": Exception(TRANSIENT_503),
+    })
+    low = chained_llm.ask("ping").lower()
+    assert "overloaded" in low, low
+    assert "try again" in low, low
+
+
+def test_timeout_is_not_a_daily_cap_or_a_burst(chained_llm):
+    assert chained_llm._classify(TRANSIENT_TIMEOUT) == "transient"
+    assert chained_llm._classify(TRANSIENT_503) == "transient"
+
+
+# --- streaming path gates ----------------------------------------------------
+# ask_stream is the path the HUD chat uses, and it must refuse the same
+# requests ask() refuses: walking the whole chain after a per-project signal
+# is what turned one daily cap into a retry storm in the logs.
+
+
+def test_stream_routing_yields_the_last_of_the_daily_budget(chained_llm):
+    # The streaming path must gate routing the way ask() does.
+    _swap_models(chained_llm, {"primary-model": "PONG"})
+    chained_llm.daily_limit = 3
+    chained_llm.answer_reserve = 1
+    for _ in range(2):
+        chained_llm._last_call = 0.0
+        assert "".join(chained_llm.ask_stream("route me", purpose="route")) == "PONG"
+    chained_llm._last_call = 0.0
+    assert "Routing is paused" in "".join(chained_llm.ask_stream("route me", purpose="route"))
+    chained_llm._last_call = 0.0
+    assert "".join(chained_llm.ask_stream("answer me")) == "PONG", "answers must still get through"
+
+
+
+def test_stream_stops_at_the_daily_cap_instead_of_walking_the_chain(chained_llm):
+    fake = _swap_models(chained_llm, {
+        "primary-model": Exception(DAILY_429),
+        "second-model": "never spoken",
+        "third-model": "never spoken",
+    })
+    spoken = "".join(chained_llm.ask_stream("ping"))
+    assert fake.tried == ["primary-model"], "wasted requests after the cap was known"
+    assert "free requests" in spoken.lower(), spoken
+
+
+def test_stream_refuses_while_a_burst_penalty_is_active(chained_llm):
+    fake = _swap_models(chained_llm, {"primary-model": "never spoken"})
+    chained_llm._penalty_until = time.monotonic() + 30
+    spoken = "".join(chained_llm.ask_stream("ping"))
+    assert fake.tried == [], "fired into an active penalty"
+    assert "rate limited" in spoken.lower(), spoken
+
+
+def test_stream_walks_the_chain_for_a_model_specific_signal(chained_llm):
+    """An unavailable model is one model's problem; the chain is still worth it."""
+    fake = _swap_models(chained_llm, {
+        "primary-model": Exception(UNAVAILABLE_404),
+        "second-model": "streamed fallback",
+    })
+    assert "".join(chained_llm.ask_stream("ping")) == "streamed fallback"
+    assert fake.tried == ["primary-model", "second-model"]
+
+

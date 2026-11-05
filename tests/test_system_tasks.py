@@ -238,3 +238,56 @@ def test_list_processes_survives_odd_rows(monkeypatch):
         "mcp.automation.subprocess.run", lambda *a, **kw: _Result()
     )
     assert "a.exe, 1 K" in AutomationMCP().list_processes()
+
+
+# --- application names ------------------------------------------------------
+
+
+def test_app_name_drops_the_politeness_speech_adds():
+    from mcp.automation import clean_app_name
+
+    assert clean_app_name("chrome for me") == "chrome"
+    assert clean_app_name("spotify please") == "spotify"
+    assert clean_app_name("the notepad app") == "notepad"
+    assert clean_app_name("Visual Studio Code") == "Visual Studio Code"
+
+
+def test_close_app_resolves_the_running_image(monkeypatch):
+    """A spoken name rarely matches the image: "spotify" is Spotify.exe."""
+    from mcp.automation import AutomationMCP
+
+    calls = []
+    state = {"killed": False}
+
+    class _Result:
+        def __init__(self, stdout=""):
+            self.stdout = stdout
+
+    def fake_run(args, **kwargs):
+        calls.append(args)
+        if args[0] == "tasklist":
+            if state["killed"]:
+                return _Result("")
+            return _Result('"Spotify.exe","1234","Console","1","100,000 K"\r\n')
+        state["killed"] = True
+        return _Result()
+
+    monkeypatch.setattr("mcp.automation.subprocess.run", fake_run)
+    out = AutomationMCP().close_app("spotify")
+
+    assert "Closed spotify" in out
+    assert ["taskkill", "/IM", "Spotify.exe"] in calls
+    assert not any("/F" in args for args in calls), "force kill used needlessly"
+
+
+def test_close_app_reports_a_missing_application(monkeypatch):
+    from mcp.automation import AutomationMCP
+
+    class _Result:
+        stdout = '"explorer.exe","1","Console","1","10 K"\r\n'
+
+    monkeypatch.setattr(
+        "mcp.automation.subprocess.run", lambda *a, **kw: _Result()
+    )
+    out = AutomationMCP().close_app("nothing at all")
+    assert "couldn't find" in out

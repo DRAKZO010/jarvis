@@ -7,6 +7,7 @@ depends on: URL paths, JSON field names, and event types.
 from __future__ import annotations
 
 import json
+import logging
 import time
 
 import pytest
@@ -84,6 +85,21 @@ def test_api_metrics_shape(client):
     for key in ("cpu_pct", "ram_pct", "ram_used", "ram_total", "disk_pct",
                 "net_sent", "net_recv", "uptime", "process_count"):
         assert key in body, f"missing metric {key!r}"
+
+
+def test_api_cosmos_shape(client):
+    """The galaxy feed: memories, skills, abilities, and missions."""
+    body = client.get("/api/cosmos").json()
+    for key in ("identity", "memories", "skills", "abilities", "tasks", "stats"):
+        assert key in body, f"missing cosmos key {key!r}"
+    for memory in body["memories"]:
+        assert {"fact", "timestamp"} <= set(memory)
+    for skill in body["skills"]:
+        assert {"name", "description"} <= set(skill)
+    for ability in body["abilities"]:
+        assert {"name", "description"} <= set(ability)
+    for key in ("memories", "skills", "abilities", "missions"):
+        assert isinstance(body["stats"][key], int)
 
 
 def test_metrics_percentages_are_in_range(client):
@@ -350,6 +366,96 @@ def test_websocket_ptt_release_is_broadcast(client_module):
                     if states == [True, False]:
                         break
             assert states == [True, False], states
+
+
+# --- HUD panels --------------------------------------------------------------
+# The side panels are hidden until they are asked for, so a client has to be
+# told where they stand as soon as it connects, and again whenever that
+# changes.
+
+def test_panels_are_hidden_by_default(client_module):
+    assert client_module._panels_visible is False
+
+
+def test_client_is_told_the_panel_state_on_connect(client):
+    with client.websocket_connect("/ws") as ws:
+        msg = ws.receive_json()
+        assert msg["type"] == "panels"
+        assert msg["visible"] is False
+
+
+def test_show_panels_command_shows_them(client_module, silence_voice, monkeypatch):
+    sent = []
+    monkeypatch.setattr(client_module, "broadcast", lambda msg: sent.append(msg))
+    monkeypatch.setattr(client_module, "_panels_visible", False)
+    client_module.handle_command("show panels", {})
+    assert client_module._panels_visible is True
+    assert {"type": "panels", "visible": True} in sent
+
+
+def test_hide_panels_command_hides_them(client_module, silence_voice, monkeypatch):
+    sent = []
+    monkeypatch.setattr(client_module, "broadcast", lambda msg: sent.append(msg))
+    monkeypatch.setattr(client_module, "_panels_visible", True)
+    client_module.handle_command("hide panels", {})
+    assert client_module._panels_visible is False
+    assert {"type": "panels", "visible": False} in sent
+
+
+def test_metrics_broadcast_reports_the_listening_microphone(client):
+    """The HUD shows that the microphone is always on."""
+    with client.websocket_connect("/ws") as ws:
+        for _ in range(40):
+            msg = ws.receive_json()
+            if msg.get("type") == "metrics":
+                assert "listening" in msg
+                return
+        pytest.fail("no metrics broadcast within 40 frames")
+
+
+# --- websocket close classification -----------------------------------------
+# Closing or reloading the HUD tab is normal traffic and used to be logged as
+# a warning, so real faults were buried under ~80 noise lines per session.
+
+
+def _wait_for_log(caplog, needle, level, timeout=5.0):
+    """Poll for a matching record; the endpoint finishes on another task."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        for record in caplog.records:
+            if record.levelno >= level and needle in record.getMessage():
+                return record
+        time.sleep(0.05)
+    seen = [f"{r.levelname}:{r.getMessage()}" for r in caplog.records]
+    pytest.fail(f"no record with {needle!r} at >= {level} in {timeout}s: {seen}")
+
+
+def _websocket_faults(caplog):
+    import logging
+    return [
+        r.getMessage() for r in caplog.records
+        if r.levelno >= logging.WARNING and "WebSocket" in r.getMessage()
+    ]
+
+
+def test_normal_tab_close_is_logged_as_info_not_a_warning(client, caplog):
+    caplog.set_level(logging.INFO, logger="jarvis")
+    with client.websocket_connect("/ws"):
+        pass
+    record = _wait_for_log(caplog, "client went away", logging.INFO)
+    assert record.levelno == logging.INFO
+    assert "code 1000" in record.getMessage()
+    assert _websocket_faults(caplog) == []
+
+
+def test_unusual_close_code_is_still_a_warning(client, caplog):
+    """An unexpected code is a real fault and must not be filed as noise."""
+    caplog.set_level(logging.INFO, logger="jarvis")
+    with client.websocket_connect("/ws") as ws:
+        ws.close(code=4000, reason="something went wrong")
+        _wait_for_log(caplog, "closed unexpectedly", logging.WARNING)
+    assert not any("client went away" in m for m in caplog.messages)
+    assert _websocket_faults(caplog)
 
 
 # --- window title matching -------------------------------------------------

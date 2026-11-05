@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 import importlib.util
+import json
 import logging
 import os
 import re
 import time
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from .base import MCPBase
@@ -86,6 +88,24 @@ def _is_model_unavailable(err_str: str) -> bool:
     return any(marker in low for marker in _UNAVAILABLE_MARKERS)
 
 
+def _is_transient_error(err_str: str) -> bool:
+    """True when the provider is busy or the connection dropped.
+
+    Gemini reports a busy backend as 503 and the OpenAI client reports a stalled
+    stream as a timeout. Neither says anything about the model's quota, so the
+    model stays usable and the next one in the chain is worth trying.
+    """
+    low = err_str.lower()
+    if any(code in err_str for code in ("502", "503", "504")):
+        return True
+    if "error code: 500" in low or "500 internal" in low:
+        return True
+    return any(marker in low for marker in (
+        "overloaded", "timed out", "timeout", "temporarily unavailable",
+        "connection error", "connection reset", "server error",
+    ))
+
+
 def _retry_delay(err_str: str, default: float) -> float:
     """Seconds the provider asked us to wait, when it says."""
     match = re.search(r"retryDelay[^0-9]*([\d.]+)", err_str)
@@ -153,6 +173,30 @@ class LLMMCP(MCPBase):
         self._user_cache = None
         self._conversation_history: List[Dict[str, str]] = []
         self._max_history = 10
+        self._budget_path = Path(os.getenv("LLM_BUDGET_PATH", str(Path(__file__).resolve().parent.parent / "jarvis_llm_budget.json")))
+        self._load_budget()
+
+    def _load_budget(self) -> None:
+        try:
+            raw = json.loads(self._budget_path.read_text(encoding="utf-8"))
+            self._exhausted_until = {k: float(v) for k, v in (raw.get("exhausted_until") or {}).items()}
+            self._daily_spend = {k: int(v) for k, v in (raw.get("daily_spend") or {}).items()}
+            self._spend_day = raw.get("spend_day")
+        except Exception:
+            self._exhausted_until = {}
+            self._daily_spend = {}
+            self._spend_day = None
+
+    def _save_budget(self) -> None:
+        try:
+            self._budget_path.parent.mkdir(parents=True, exist_ok=True)
+            self._budget_path.write_text(json.dumps({
+                "spend_day": self._spend_day,
+                "daily_spend": self._daily_spend,
+                "exhausted_until": self._exhausted_until,
+            }), encoding="utf-8")
+        except Exception as e:
+            log.debug("LLM budget persist failed: %s", e)
 
     def initialize(self) -> bool:
         """Initialize LLM module."""
@@ -240,6 +284,7 @@ class LLMMCP(MCPBase):
     def _record_spend(self, model: str) -> None:
         self._spend_for(model)
         self._daily_spend[model] = self._daily_spend.get(model, 0) + 1
+        self._save_budget()
 
     def _spend_today(self) -> int:
         return sum(self._spend_for(model) for model in self.models)
@@ -290,6 +335,7 @@ class LLMMCP(MCPBase):
             # Nothing about this model improves until the day rolls over.
             reset = _next_local_midnight()
             self._exhausted_until[model] = reset
+            self._save_budget()
             log.warning(
                 "%s has used its daily request allowance; next usable at %s",
                 model,
@@ -319,6 +365,8 @@ class LLMMCP(MCPBase):
             return "burst"
         if self._out_of_credit(err_str):
             return "credit"
+        if _is_transient_error(err_str):
+            return "transient"
         return "other"
 
     def _failure_message(self, kind: str) -> str:
@@ -330,6 +378,8 @@ class LLMMCP(MCPBase):
             return "My AI core is rate limited. Please wait a moment and try again, sir."
         if kind == "credit":
             return "My AI core is out of quota. Please check your Gemini API key, sir."
+        if kind == "transient":
+            return "My AI core is overloaded right now. Please try again in a moment, sir."
         return "My AI core hit an error. Please try again, sir."
 
     def _exhausted_message(self) -> str:
@@ -391,13 +441,20 @@ class LLMMCP(MCPBase):
         if len(self._conversation_history) > self._max_history * 2:
             self._conversation_history = self._conversation_history[-self._max_history * 2:]
 
+    def _penalty_refusal(self) -> Optional[str]:
+        """Spoken refusal while the burst penalty is up, else ``None``."""
+        if time.monotonic() < self._penalty_until:
+            return "My AI core is rate limited. I'll be ready in a moment, sir."
+        return None
+
     def _check_cooldown(self, skip: bool) -> Optional[str]:
         """Return a spoken refusal if the cooldown or penalty is active."""
         if skip:
             return None
+        refusal = self._penalty_refusal()
+        if refusal:
+            return refusal
         now = time.monotonic()
-        if now < self._penalty_until:
-            return "My AI core is rate limited. I'll be ready in a moment, sir."
         if now - self._last_call < self.cooldown:
             remaining = self.cooldown - (now - self._last_call)
             return f"Please wait {remaining:.0f} seconds before the next query, sir."
@@ -447,9 +504,9 @@ class LLMMCP(MCPBase):
                 err_str = str(e)
                 log.error("LLM error on %s: %s", model, e)
                 last_kind = self._note_failure(model, err_str)
-                if last_kind in ("daily", "unavailable"):
-                    # Only these are specific to one model, so only these are
-                    # worth sidestepping.
+                if last_kind in ("daily", "unavailable", "transient"):
+                    # These are specific to one model or to the provider's
+                    # current load, so the next model is worth trying.
                     continue
                 return self._failure_message(last_kind)
 
@@ -470,12 +527,29 @@ class LLMMCP(MCPBase):
             return "My AI core returned an empty response. Please try again, sir."
         return self._failure_message(last_kind)
 
-    def ask_stream(self, prompt: str, system_prompt: str = "", use_history: bool = True):
-        """Stream an LLM response token by token for lower first-token latency."""
-        refusal = self._check_cooldown(False)
+    def ask_stream(
+        self,
+        prompt: str,
+        system_prompt: str = "",
+        use_history: bool = True,
+        skip_cooldown: bool = False,
+        purpose: str = "answer",
+        temperature: float = 0.8,
+    ):
+        """Stream an LLM response token by token for lower first-token latency.
+
+        Mirrors the :meth:`ask` guardrails for the streaming path.
+        """
+        refusal = self._check_cooldown(skip_cooldown)
         if refusal:
             yield refusal
             return
+
+        if purpose == "route":
+            gated = self._routing_budget_gate()
+            if gated:
+                yield gated
+                return
 
         client = self._get_client()
         if not client:
@@ -491,12 +565,24 @@ class LLMMCP(MCPBase):
         last_kind = "other"
 
         for model in models:
+            # The penalty is provider-wide, so a model fired after it started
+            # would hit the same wall the one before it did. Re-checked per
+            # model because failures inside this loop move the penalty.
+            refusal = self._penalty_refusal()
+            if refusal:
+                yield refusal
+                return
+            if purpose == "route":
+                gated = self._routing_budget_gate()
+                if gated:
+                    yield gated
+                    return
             parts: List[str] = []
             try:
                 stream = client.chat.completions.create(
                     model=model,
                     messages=messages,
-                    temperature=0.8,
+                    temperature=temperature,
                     max_tokens=self.max_tokens,
                     stream=True,
                 )
@@ -523,7 +609,17 @@ class LLMMCP(MCPBase):
                 err_str = str(e)
                 log.error("LLM stream error on %s: %s", model, e)
                 last_kind = self._note_failure(model, err_str)
-                if last_kind in ("daily", "unavailable"):
+                if last_kind == "daily":
+                    # The daily cap is shared per project, not per model, so
+                    # every model left in the chain would fail the same way.
+                    # Stop instead of hammering the cap model by model.
+                    yield self._failure_message(last_kind)
+                    return
+                if last_kind == "unavailable":
+                    continue
+                if last_kind == "transient" and not parts:
+                    # Nothing of this reply has been spoken yet, so the next
+                    # model can answer cleanly instead of giving up.
                     continue
                 yield self._failure_message(last_kind)
                 return

@@ -237,6 +237,39 @@ def test_routing_survives_a_provider_error(app_module, monkeypatch):
     assert app_module._llm_parse_command("anything") is None
 
 
+def test_routing_short_circuits_when_the_core_is_unavailable(app_module, monkeypatch):
+    """A client known to be missing must not be dialed on every utterance."""
+    calls = []
+
+    def ask(prompt, **kwargs):
+        calls.append(prompt)
+        return '{"action":"chat","payload":""}'
+
+    monkeypatch.setattr(app_module.llm_mcp, "ask", ask)
+    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+    app_module._ROUTE_CACHE.clear()
+    assert app_module._llm_parse_command("utterance with no pattern") is None
+    assert calls == [], "spent an attempt on a client known to be missing"
+
+
+def test_routing_still_uses_the_cache_while_offline(app_module, monkeypatch):
+    """A decision already paid for stays usable with the core down."""
+    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+    app_module._ROUTE_CACHE.clear()
+    phrase = "utterance remembered while online"
+    app_module._ROUTE_CACHE[" ".join(phrase.split())] = ("add_task", "buy milk")
+    assert app_module._llm_parse_command(phrase) == ("add_task", "buy milk")
+
+
+def test_self_heal_skips_the_missing_client(app_module, monkeypatch):
+    calls = []
+    monkeypatch.setattr(app_module.llm_mcp, "ask",
+                        lambda *a, **k: calls.append(a) or "diagnosis")
+    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+    assert app_module._try_self_heal("boom", "test") is False
+    assert calls == [], "self-heal dialed a client known to be missing"
+
+
 # --------------------------------------------------------------------------- #
 # Quota protection
 # --------------------------------------------------------------------------- #

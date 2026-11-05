@@ -96,3 +96,34 @@ def test_failing_action_does_not_raise(silence_voice, app_module, spoken, monkey
     assert _texts(spoken)
     assert app_module._last_error is not None
     assert "device went away" in app_module._last_error
+
+
+def test_bare_string_exception_is_logged_with_traceback(silence_voice, app_module, spoken, monkeypatch):
+    def boom():
+        raise "nope"
+
+    monkeypatch.setattr(app_module, "_try_self_heal", lambda *a, **kw: False,
+                        raising=False)
+    app_module._last_error = None
+    import logging
+    import io
+
+    stream = io.StringIO()
+    handler = logging.StreamHandler(stream)
+    handler.setLevel(logging.ERROR)
+    app_module.log.addHandler(handler)
+    try:
+        app_module._speak_during_act(boom, "Opening Spotify...")
+        _settle(app_module.ACTION_ANSWER_GRACE_S * 3)
+    finally:
+        app_module.log.removeHandler(handler)
+
+    logged = stream.getvalue()
+    assert "Action error in" in logged
+    assert "nope" in logged
+    assert "Traceback" in logged
+    assert app_module._last_error is not None
+    # The original bare string is preserved in the logged/recorded error.
+    assert "nope" in app_module._last_error
+
+

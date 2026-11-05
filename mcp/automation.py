@@ -7,6 +7,7 @@ import os
 import re
 import shutil
 import subprocess
+import time
 try:
     import pyautogui
     import win32gui
@@ -95,6 +96,38 @@ DANGEROUS_PATTERNS = [
     r"logoff",
 ]
 
+# Speech wraps an app name in politeness: "open chrome for me" is a request to
+# launch chrome, not an application called "chrome for me". Strip only the
+# trailing courtesies, and a leading/trailing "app" qualifier, so a real name
+# such as "visual studio code" is left alone.
+_COURTESY_SUFFIX = re.compile(
+    r"(?:\s+(?:for\s+me|please|sir|ma'am|now|right\s+now|thanks|thank\s+you))+$",
+    re.IGNORECASE,
+)
+_APP_QUALIFIER_PREFIX = re.compile(r"^(?:the\s+)?(?:app|application)\s+|\bthe\s+", re.IGNORECASE)
+_APP_QUALIFIER_SUFFIX = re.compile(r"\s+(?:app|application)$", re.IGNORECASE)
+
+
+def clean_app_name(name: str) -> str:
+    """Return an app name without the words speech wraps around it."""
+    cleaned = (name or "").strip().strip(" .,!?;:")
+    # Strip qualifiers from both ends; repeat so "the the app" collapses, and
+    # to handle order like "app notepad app" in the normal form.
+    for _ in range(3):
+        prev = cleaned
+        cleaned = _APP_QUALIFIER_PREFIX.sub("", cleaned)
+        cleaned = _APP_QUALIFIER_SUFFIX.sub("", cleaned).strip(" .,!?;:")
+        if cleaned == prev:
+            break
+    cleaned = _COURTESY_SUFFIX.sub("", cleaned).strip(" .,!?;:")
+    for _ in range(2):
+        prev = cleaned
+        cleaned = _APP_QUALIFIER_PREFIX.sub("", cleaned)
+        cleaned = _APP_QUALIFIER_SUFFIX.sub("", cleaned).strip(" .,!?;:")
+        if cleaned == prev:
+            break
+    return cleaned
+
 
 class AutomationMCP(MCPBase):
     """System automation MCP module."""
@@ -147,6 +180,7 @@ class AutomationMCP(MCPBase):
 
     def open_app(self, app_name: str) -> str:
         """Open an application or website."""
+        app_name = clean_app_name(app_name)
         if not app_name:
             return "What should I open, sir?"
 
@@ -401,6 +435,83 @@ class AutomationMCP(MCPBase):
             return f"Killed process: {name}"
         except Exception as e:
             return f"Error killing process: {e}"
+
+    def _process_images(self) -> list[str]:
+        """Image names from tasklist, or an empty list if it cannot be read."""
+        try:
+            result = subprocess.run(
+                ["tasklist", "/FO", "CSV", "/NH"],
+                capture_output=True, text=True, timeout=10,
+            )
+        except Exception as e:
+            log.warning("Could not list processes: %s", e)
+            return []
+        images = []
+        for parts in csv.reader((result.stdout or "").splitlines()):
+            # During shutdown rows are short or padded; only the first column
+            # is trusted, because that is the image name.
+            if parts and parts[0].strip():
+                images.append(parts[0].strip())
+        return images
+
+    def _find_process_image(self, app: str) -> str:
+        """Resolve an app name to a running image name, exact match first.
+
+        ``app`` is already lower-case. A user says "close chrome", not
+        "chrome.exe", so the extension is stripped before comparing.
+        """
+        images = self._process_images()
+        exact, partial = "", ""
+        for image in images:
+            stem = image.lower()
+            if stem.endswith(".exe"):
+                stem = stem[:-4]
+            if stem == app:
+                exact = image
+                break
+            if not partial and app in stem:
+                partial = image
+        return exact or partial
+
+    def _is_running(self, image: str) -> bool:
+        wanted = image.lower()
+        return any(name.lower() == wanted for name in self._process_images())
+
+    def close_app(self, app_name: str) -> str:
+        """Close an app by name: politely first, forcibly only if it refuses.
+
+        "close spotify" used to be routed to ``open_app`` because there was no
+        close action, which opened the very thing the user asked to shut. The
+        pattern table claims this phrasing now, and this is what it lands on.
+        """
+        app = clean_app_name(app_name).lower()
+        if not app:
+            return "What should I close, sir?"
+
+        image = KNOWN_APPS.get(app, "")
+        if not image.lower().endswith(".exe"):
+            # Launchers and URI schemes ("spotify:", "ms-settings:") do not
+            # name a process; resolve the running image from the utterance.
+            image = ""
+
+        if not image:
+            image = self._find_process_image(app)
+            if not image:
+                return f"I couldn't find an application called {app}, sir."
+
+        try:
+            subprocess.run(["taskkill", "/IM", image],
+                           capture_output=True, timeout=10)
+            deadline = time.monotonic() + 2.0
+            while self._is_running(image) and time.monotonic() < deadline:
+                time.sleep(0.2)
+            if self._is_running(image):
+                subprocess.run(["taskkill", "/F", "/IM", image],
+                               capture_output=True, timeout=10)
+            return f"Closed {app}, sir."
+        except Exception as e:
+            log.warning("close_app(%r) failed: %s", app, e)
+            return f"I couldn't close {app}, sir."
 
     def list_processes(self) -> str:
         """List running processes, with the memory they are actually using."""

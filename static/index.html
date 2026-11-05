@@ -6,13 +6,10 @@
 <title>Jarvis</title>
 <!--
   ╔══════════════════════════════════════════════════════════════╗
-  ║  HUD DESIGN — LOCKED                                        ║
-  ║  Status: FROZEN — DO NOT MODIFY                             ║
+  ║  J.A.R.V.I.S. — NEURAL GALAXY HUD                           ║
+  ║  Every particle is a memory, a skill, an ability, or a      ║
+  ║  mission. The neural core at the centre is the brain.        ║
   ║  Author: Mohammed Nabeel                                    ║
-  ║  Last Updated: 2026-06-30                                   ║
-  ║                                                             ║
-  ║  This HUD design is FINAL. Any visual/UX changes must be    ║
-  ║  approved by the creator before implementation.             ║
   ╚══════════════════════════════════════════════════════════════╝
 -->
 <link rel="stylesheet" href="style.css">
@@ -20,6 +17,9 @@
 </head>
 <body>
 <div id="hud">
+  <!-- Neural galaxy field (stars, orbits, particles) -->
+  <canvas id="galaxy-canvas"></canvas>
+
   <!-- Top Bar -->
   <div id="top-bar">
     <div class="top-left">
@@ -31,13 +31,44 @@
       <span id="date" class="date">STARK INDUSTRIES</span>
     </div>
     <div class="top-right">
-      <span class="label">STATUS</span>
+      <span class="label">CORE LINK</span>
       <span id="system-status" class="value accent">ONLINE</span>
+      <span class="label">MIC</span>
+      <span id="mic-link" class="value accent">STANDBY</span>
     </div>
   </div>
 
   <!-- Left Panel -->
   <div id="left-panel">
+    <!-- Neural Galaxy -->
+    <div class="panel-section">
+      <div class="panel-header">NEURAL GALAXY</div>
+      <div class="operator-line">
+        <span class="operator-label">OPERATOR</span>
+        <span id="cosmos-operator" class="operator-name">—</span>
+      </div>
+      <div class="cosmos-row">
+        <i class="dot memory"></i>
+        <span class="cosmos-label">MEMORIES</span>
+        <span id="cosmos-memories" class="cosmos-count">0</span>
+      </div>
+      <div class="cosmos-row">
+        <i class="dot skill"></i>
+        <span class="cosmos-label">SKILLS</span>
+        <span id="cosmos-skills" class="cosmos-count">0</span>
+      </div>
+      <div class="cosmos-row">
+        <i class="dot ability"></i>
+        <span class="cosmos-label">ABILITIES</span>
+        <span id="cosmos-abilities" class="cosmos-count">0</span>
+      </div>
+      <div class="cosmos-row">
+        <i class="dot mission"></i>
+        <span class="cosmos-label">MISSIONS</span>
+        <span id="cosmos-missions" class="cosmos-count">0</span>
+      </div>
+    </div>
+
     <!-- System Metrics -->
     <div class="panel-section">
       <div class="panel-header">SYSTEM METRICS</div>
@@ -81,13 +112,73 @@
     </div>
   </div>
 
+  <!-- Center - Neural Core -->
+  <div id="center">
+    <div id="core-stack">
+      <div id="brain-core">
+        <div class="core-halo"></div>
+        <div class="core-orbit orbit-1"></div>
+        <div class="core-orbit orbit-2"></div>
+        <div class="core-orbit orbit-3"></div>
+        <svg class="brain-glyph" viewBox="0 0 120 120" aria-hidden="true">
+          <g class="dendrites" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round">
+            <path d="M60 60 L60 26"/>
+            <path d="M60 60 L87 37"/>
+            <path d="M60 60 L95 60"/>
+            <path d="M60 60 L87 83"/>
+            <path d="M60 60 L60 94"/>
+            <path d="M60 60 L33 83"/>
+            <path d="M60 60 L25 60"/>
+            <path d="M60 60 L33 37"/>
+            <path d="M60 60 C46 48 41 43 37 31"/>
+            <path d="M60 60 C74 48 79 43 83 31"/>
+            <path d="M60 60 C46 72 41 77 37 89"/>
+            <path d="M60 60 C74 72 79 77 83 89"/>
+          </g>
+          <g class="synapses" fill="currentColor">
+            <circle cx="60" cy="26" r="2.2"/>
+            <circle cx="87" cy="37" r="2.2"/>
+            <circle cx="95" cy="60" r="2.2"/>
+            <circle cx="87" cy="83" r="2.2"/>
+            <circle cx="60" cy="94" r="2.2"/>
+            <circle cx="33" cy="83" r="2.2"/>
+            <circle cx="25" cy="60" r="2.2"/>
+            <circle cx="33" cy="37" r="2.2"/>
+            <circle cx="37" cy="31" r="1.7"/>
+            <circle cx="83" cy="31" r="1.7"/>
+            <circle cx="37" cy="89" r="1.7"/>
+            <circle cx="83" cy="89" r="1.7"/>
+          </g>
+          <circle class="core-node" cx="60" cy="60" r="6.5" fill="currentColor"/>
+          <circle class="core-node-ring" cx="60" cy="60" r="14" fill="none" stroke="currentColor" stroke-width="0.9" opacity="0.55"/>
+        </svg>
+        <div class="core-flare"></div>
+      </div>
+
+      <div id="jarvis-status">
+        <div class="status-label">NEURAL CORE</div>
+        <div id="status-text" class="status-value">STANDBY</div>
+      </div>
+
+      <!-- Last reply, shown while the side panels are hidden -->
+      <div id="reply-caption" aria-live="polite"></div>
+    </div>
+
+    <div id="cosmos-legend">
+      <span class="legend-item"><i class="dot memory"></i>MEMORIES</span>
+      <span class="legend-item"><i class="dot skill"></i>SKILLS</span>
+      <span class="legend-item"><i class="dot ability"></i>ABILITIES</span>
+      <span class="legend-item"><i class="dot mission"></i>MISSIONS</span>
+    </div>
+  </div>
+
   <!-- Right Panel -->
   <div id="right-panel">
     <!-- Tasks -->
     <div class="panel-section">
-      <div class="panel-header">TASKS</div>
+      <div class="panel-header">MISSIONS</div>
       <div id="task-list" class="scroll-list">
-        <div class="empty-text">No pending tasks</div>
+        <div class="empty-text">No pending missions</div>
       </div>
     </div>
 
@@ -99,7 +190,19 @@
       </div>
     </div>
 
-    <!-- Input -->
+    <!-- Self-evolution. Changes the assistant proposes for itself land here,
+         and nothing is applied until a person says so. -->
+    <div class="panel-section">
+      <div class="panel-header">SELF-EVOLUTION</div>
+      <div id="evolution-list" class="scroll-list">
+        <div class="empty-text">No changes pending</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Command bar. It lives outside the side panels so it - and the
+       microphone with it - stay available when the panels are hidden. -->
+  <div id="input-bar">
     <div class="input-section">
       <input type="text" id="cmd-input" placeholder="Enter command..." autocomplete="off">
       <button id="cmd-send" class="send-btn">SEND</button>
@@ -110,67 +213,6 @@
         </svg>
         <span id="mic-status">MIC OFF</span>
       </button>
-    </div>
-  </div>
-
-  <!-- Center - Arc Reactor -->
-  <div id="center">
-    <div id="arc-reactor">
-      <div class="reactor-ring ring-1"></div>
-      <div class="reactor-ring ring-2"></div>
-      <div class="reactor-ring ring-3"></div>
-      <div class="reactor-core"></div>
-      <div class="reactor-glow"></div>
-    </div>
-
-    <!-- Status Text -->
-    <div id="jarvis-status">
-      <div class="status-label">STATUS</div>
-      <div id="status-text" class="status-value">STANDBY</div>
-    </div>
-
-    <!-- Circular Metrics around reactor -->
-    <div id="circle-metrics">
-      <div class="circle-metric" style="--angle: 0deg" id="cm-cpu">
-        <svg viewBox="0 0 36 36">
-          <circle class="bg" cx="18" cy="18" r="15.9"/>
-          <circle class="fill" cx="18" cy="18" r="15.9"/>
-        </svg>
-        <span class="cm-label">CPU</span>
-        <span class="cm-value">0%</span>
-      </div>
-      <div class="circle-metric" style="--angle: 72deg" id="cm-ram">
-        <svg viewBox="0 0 36 36">
-          <circle class="bg" cx="18" cy="18" r="15.9"/>
-          <circle class="fill" cx="18" cy="18" r="15.9"/>
-        </svg>
-        <span class="cm-label">RAM</span>
-        <span class="cm-value">0%</span>
-      </div>
-      <div class="circle-metric" style="--angle: 144deg" id="cm-disk">
-        <svg viewBox="0 0 36 36">
-          <circle class="bg" cx="18" cy="18" r="15.9"/>
-          <circle class="fill" cx="18" cy="18" r="15.9"/>
-        </svg>
-        <span class="cm-label">DSK</span>
-        <span class="cm-value">0%</span>
-      </div>
-      <div class="circle-metric" style="--angle: 216deg" id="cm-net">
-        <svg viewBox="0 0 36 36">
-          <circle class="bg" cx="18" cy="18" r="15.9"/>
-          <circle class="fill" cx="18" cy="18" r="15.9"/>
-        </svg>
-        <span class="cm-label">NET</span>
-        <span class="cm-value">0 KB/s</span>
-      </div>
-      <div class="circle-metric" style="--angle: 288deg" id="cm-bat">
-        <svg viewBox="0 0 36 36">
-          <circle class="bg" cx="18" cy="18" r="15.9"/>
-          <circle class="fill" cx="18" cy="18" r="15.9"/>
-        </svg>
-        <span class="cm-label">BAT</span>
-        <span class="cm-value">0%</span>
-      </div>
     </div>
   </div>
 
@@ -201,9 +243,26 @@
       <span>EMAIL</span>
     </button>
     <button class="nav-btn" data-cmd="search for " title="Search">
-      <svg viewBox="0 0 24 24"><path d="M15.5 14h-.79l-.28-.27C15.41 12.59 16 11.11 16 9.5 16 5.91 13.09 3 9.5 3S3 5.91 3 9.5 5.91 16 9.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19l-4.99-5zm-6 0C7.01 14 5 11.99 5 9.5S7.01 5 9.5 5 14 7.01 14 9.5 11.99 14 9.5 14z"/></svg>
+      <svg viewBox="0 0 24 24"><path d="M15.5 14h-.79l-.28-.27C15.41 12.59 16 11.11 16 9.5 16 5.91 13.09 3 9.5 3S3 5.91 3 9.5 5.91 16 9.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19l-4.99-5zm-6 0C7.01 16 5 13.99 5 11.5S7.01 7 9.5 7s4.5 1.99 4.5 4.5S11.99 16 9.5 16z"/></svg>
       <span>SEARCH</span>
     </button>
+    <button class="nav-btn" id="panels-btn" title="Show or hide the side panels">
+      <svg viewBox="0 0 24 24"><path d="M3 3h18v18H3V3zm2 16h14V5H5v14zm2-13h10v11H7V6z"/></svg>
+      <span>PANELS</span>
+    </button>
+    <button class="nav-btn" id="evolve-btn" title="Ask Jarvis to review its own code">
+      <svg viewBox="0 0 24 24"><path d="M12 2a10 10 0 1 0 10 10h-2a8 8 0 1 1-8-8V2zm1 4h-2v6l4.75 2.85 1-1.64L13 11.27V6z"/></svg>
+      <span>EVOLVE</span>
+    </button>
+  </div>
+
+
+  <!-- Particle details -->
+  <div id="particle-tooltip" class="particle-tooltip">
+    <div class="tt-kind"></div>
+    <div class="tt-label"></div>
+    <div class="tt-detail"></div>
+    <div class="tt-meta"></div>
   </div>
 
   <!-- Scanning Line -->

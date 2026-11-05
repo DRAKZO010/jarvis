@@ -100,6 +100,14 @@ CASES = [
     ("maximise the window", "maximize_window", None),
     ("close the window", "close_window", None),
     ("close the tab", "close_tab", None),
+    # Regression: "close spotify" had no action, so the model picked open_app
+    # and launched the app the user asked to shut.
+    ("close spotify", "close_app", "spotify"),
+    ("quit chrome", "close_app", "chrome"),
+    ("exit notepad", "close_app", "notepad"),
+    ("close notepad for me", "close_app", "notepad"),
+    # The close-app rule must not steal the media transport wording.
+    ("stop the music", "spotify_pause", None),
     ("show the processes", "list_processes", None),
 
     # --- "running apps" needs a bare form, not just a question ---
@@ -150,6 +158,17 @@ CASES = [
     ("list directory", "list_directory", None),
     ("list folder", "list_directory", None),
     ("ls", "list_directory", None),
+
+    # --- the side panels are hidden until they are asked for ---
+    ("show panels", "show_panels", None),
+    ("show the panels", "show_panels", None),
+    ("show me the side panels", "show_panels", None),
+    ("show the dashboard", "show_panels", None),
+    ("show system metrics", "show_panels", None),
+    ("hide panels", "hide_panels", None),
+    ("hide the panels", "hide_panels", None),
+    ("hide the sidebar", "hide_panels", None),
+    ("hide everything", "hide_panels", None),
 
     # --- conversation ---
     ("hello", "greeting", None),

@@ -159,6 +159,10 @@ class MemoryMCP(MCPBase):
         self._memory["secure_identity"].update(kwargs)
         self._save_memory()
 
+    def get_facts(self) -> list:
+        """Return a copy of the stored facts, oldest first."""
+        return [dict(f) for f in self._memory.get("known_facts", [])]
+
     def get_facts_for_prompt(self) -> str:
         """Get facts formatted for LLM prompt."""
         facts = self._memory.get("known_facts", [])

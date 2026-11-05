@@ -46,6 +46,14 @@ class SystemMCP(MCPBase):
         super().__init__()
         self._last_cpu = 0.0
         self._last_net = {"bytes_sent": 0, "bytes_recv": 0}
+        self._process_count_cache: Optional[int] = None
+        self._process_count_at = 0.0
+        # Prime psutil's non-blocking CPU sampler so the first reading is a
+        # real one instead of a flat zero.
+        try:
+            psutil.cpu_percent(interval=None)
+        except Exception:
+            pass
 
     def initialize(self) -> bool:
         """Initialize system monitoring."""
@@ -102,7 +110,9 @@ class SystemMCP(MCPBase):
 
     def get_metrics(self) -> Dict[str, Any]:
         """Get system metrics for UI."""
-        cpu = psutil.cpu_percent(interval=0.1)
+        # interval=None compares against the previous call instead of
+        # blocking for a tenth of a second on every tick.
+        cpu = psutil.cpu_percent(interval=None)
         ram = psutil.virtual_memory()
         disk = psutil.disk_usage("C:\\")
         net = psutil.net_io_counters()
@@ -147,8 +157,24 @@ class SystemMCP(MCPBase):
             "net_sent": metrics.get("net_sent", 0),
             "net_recv": metrics.get("net_recv", 0),
             "uptime": _format_duration(uptime_s),
-            "process_count": len(psutil.pids()),
+            "process_count": self._process_count(),
         }
+
+    def _process_count(self) -> int:
+        """How many processes are running.
+
+        Enumerating every process is a snapshot of the whole system, and the
+        HUD asks for this every couple of seconds. The number barely changes
+        between ticks, so it is refreshed on a slow clock instead.
+        """
+        now = time.monotonic()
+        if self._process_count_cache is None or now - self._process_count_at > 30.0:
+            try:
+                self._process_count_cache = len(psutil.pids())
+                self._process_count_at = now
+            except Exception:
+                return self._process_count_cache or 0
+        return self._process_count_cache
 
     def _get_cpu_info(self) -> str:
         """Get CPU information."""

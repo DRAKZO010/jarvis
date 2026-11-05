@@ -35,6 +35,12 @@ jarvis_tasks.json
 jarvis_reminders.json
 jarvis_context.json
 jarvis_memory.json
+jarvis_evolution.json
+
+# --- self-evolution: the audit trail and the saved patches are a record of
+# --- what the assistant proposed, not source. The rules are kept.
+evolution/history.jsonl
+evolution/proposals/
 
 # --- logs ---
 logs/
@@ -50,6 +56,7 @@ logs/
 
 # --- speech recognition model (large, fetched separately) ---
 model/
+model-fast/
 Kokoro-82M/
 
 # --- editors / OS ---

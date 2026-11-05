@@ -1,0 +1,30 @@
+{
+  "enabled": true,
+  "autonomous": false,
+  "auto_apply": true,
+  "allowed_paths": [
+    "mcp/",
+    "static/",
+    "jarvis.py",
+    "README.md"
+  ],
+  "protected_paths": [
+    "mcp/evolver.py",
+    "evolution/",
+    ".env",
+    ".env.*",
+    "jarvis_evolution.json",
+    "model/",
+    "venv/",
+    ".git/"
+  ],
+  "create_only_paths": [
+    "tests/"
+  ],
+  "max_files": 3,
+  "max_changed_lines": 120,
+  "max_patch_bytes": 40000,
+  "sandbox_test_timeout_s": 900,
+  "cycle_interval_min": 30,
+  "max_cycles_per_day": 8
+}

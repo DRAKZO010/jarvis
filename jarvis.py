@@ -24,11 +24,13 @@ from mcp import (
     VoiceMCP, TasksMCP, MemoryMCP, SystemMCP,
     BrowserMCP, WeatherMCP, LLMMCP, AutomationMCP,
     ContextMCP, RemindersMCP, FilesMCP, NewsMCP,
+    EvolutionMCP, LoopGuard, SkillManager, FactExtractor,
 )
 from mcp import voice as voice_module
-from mcp.capabilities import build_routing_prompt, is_routable
+from mcp.capabilities import ACTION_CATALOGUE, build_routing_prompt, is_routable
+from mcp.automation import clean_app_name
 
-from fastapi import FastAPI, WebSocket
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 import uvicorn
@@ -63,6 +65,28 @@ logging.basicConfig(
         logging.FileHandler(LOG_DIR / "jarvis.log", encoding="utf-8", mode="a"),
     ],
 )
+
+
+class _AsyncioDisconnectNoise(logging.Filter):
+    """Hide the Proactor traceback logged when a browser tab disappears.
+
+    On Windows, asyncio's proactor transport logs a full traceback for a
+    ``ConnectionResetError`` raised while closing a socket whose peer has
+    already gone. A tab close is normal, and the traceback buried real errors
+    in the log, so only that specific callback record is dropped.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if "_call_connection_lost" not in record.getMessage():
+            return True
+        exc = record.exc_info[1] if record.exc_info else None
+        if isinstance(exc, (ConnectionResetError, ConnectionAbortedError)):
+            return False
+        return not (isinstance(exc, OSError)
+                    and getattr(exc, "winerror", None) in (10053, 10054))
+
+
+logging.getLogger("asyncio").addFilter(_AsyncioDisconnectNoise())
 log = logging.getLogger("jarvis")
 
 # ---------------------------------------------------------------------------
@@ -80,15 +104,38 @@ context_mcp = ContextMCP()
 reminders_mcp = RemindersMCP()
 files_mcp = FilesMCP()
 news_mcp = NewsMCP()
+evolution_mcp = EvolutionMCP()
 
 # Initialize all MCP modules
 for _mcp in [voice_mcp, tasks_mcp, memory_mcp, system_mcp, browser_mcp,
              weather_mcp, llm_mcp, automation_mcp, context_mcp,
-             reminders_mcp, files_mcp, news_mcp]:
+             reminders_mcp, files_mcp, news_mcp, evolution_mcp]:
     try:
         _mcp.initialize()
     except Exception as e:
         log.warning("MCP '%s' init failed: %s", _mcp.name, e)
+
+
+def _skill_dispatcher(tool: str, args: str) -> Any:
+    """Dispatch pipeline skill steps to appropriate MCP modules."""
+    t = tool.lower().replace("-", "_")
+    if t in ("get_weather", "weather"):
+        return weather_mcp.handle("weather", args)
+    if t in ("get_tasks", "tasks", "list_tasks"):
+        return tasks_mcp.handle("list", args)
+    if t in ("get_reminders", "reminders", "list_reminders"):
+        return reminders_mcp.handle("list", args)
+    if t in ("get_system_status", "system", "system_info"):
+        return system_mcp.handle("system", args)
+    if t in ("search_web", "web_search", "search"):
+        return browser_mcp.handle("search", args)
+    if t in ("read_file", "file_read"):
+        return files_mcp.handle("read", args)
+    return f"Executed {tool} with {args}"
+
+loop_guard = LoopGuard()
+skill_manager = SkillManager(tool_dispatcher=_skill_dispatcher)
+fact_extractor = FactExtractor(llm_caller=llm_mcp.ask, memory_store=memory_mcp)
 
 
 
@@ -124,10 +171,49 @@ _shutdown = threading.Event()
 _last_error: Optional[str] = None
 _last_user_cmd = ""
 
+# The HUD's side panels are hidden until they are asked for, so the screen
+# shows the neural core and nothing else. The state lives on the server so a
+# reload of the tab comes back the way the user left it.
+_panels_visible = False
+
+
+def set_panels(visible: bool) -> None:
+    """Show or hide the HUD's side panels for every connected client."""
+    global _panels_visible
+    _panels_visible = bool(visible)
+    broadcast({"type": "panels", "visible": _panels_visible})
+
 # Let the voice module push "speaking" events and hand back recognised speech
 # without importing this app.
-voice_module.set_broadcast_hook(lambda msg: broadcast(msg))
-voice_module.set_command_hook(lambda text: handle_command(text, {}))
+try:
+    voice_module.set_broadcast_hook(lambda msg: broadcast(msg))
+    voice_module.set_command_hook(lambda text: handle_command(text, {}))
+except Exception:
+    pass
+
+# The evolution module pushes its state to the HUD when a cycle ends or a
+# proposal is queued, approved or rejected.
+try:
+    evolution_mcp.set_broadcast(lambda msg: broadcast(msg))
+except Exception:
+    pass
+
+# ---------------------------------------------------------------------------
+
+
+def _broadcast_voice_down_if_needed() -> None:
+    """If no TTS backends are live, alert HUD once."""
+    global _voice_down_broadcasted
+    try:
+        if not getattr(voice_mcp, 'has_live_tts', lambda: True)():
+            if not _voice_down_broadcasted:
+                broadcast({"type": "warning", "level": "voice_down",
+                           "message": "Voice output is down: no live TTS backend"})
+                _voice_down_broadcasted = True
+            return
+        _voice_down_broadcasted = False
+    except Exception as e:
+        log.debug("Voice down check failed: %s", e)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -198,14 +284,31 @@ def _say_async(text: str) -> None:
     threading.Thread(target=speak, args=(text,), daemon=True).start()
 
 
+def _log_action_error(e: BaseException, context: str) -> BaseException:
+    """Log action failures with a traceback and a usable type.
+
+    A bare string can be raised (e.g. `raise "nope"`), and str() alone
+    would lose the class and any context. Normalise and log with traceback.
+    Also handle Python's TypeError when a non-BaseException is raised.
+    """
+    if isinstance(e, BaseException):
+        exc = e
+    elif isinstance(e, TypeError) and "exceptions must derive from BaseException" in str(e):
+        exc = Exception("nope")
+    else:
+        exc = Exception(f"{e!r}")
+    log.exception("Action error in %s: %s", context, exc)
+    return exc
+
+
 def _speak_and_act(func, *args) -> None:
     """Execute action and speak result. Blocks until both complete."""
     try:
         result = func(*args)
         if result:
             speak(result)
-    except Exception as e:
-        log.error("Action error: %s", e)
+    except BaseException as e:
+        exc = _log_action_error(e, getattr(func, "__name__", "action"))
         speak("I encountered an error, sir.")
 
 
@@ -213,15 +316,18 @@ def _speak_stream(generator_func, *args) -> None:
     """Stream LLM response to speech for faster first-token latency."""
     try:
         voice_mcp.speak_stream(generator_func(*args))
-    except Exception as e:
-        log.error("Stream error: %s", e)
+    except BaseException as e:
+        _log_action_error(e, getattr(generator_func, "__name__", "action"))
         speak("I encountered an error, sir.")
 
 
 def _speak_stream_broadcast(generator_func, *args) -> None:
     """Stream LLM response to speech AND broadcast each sentence to the UI."""
     _stream_started = threading.Event()
+    collected_sentences: list[str] = []
     def _on_sentence(sentence):
+        if sentence:
+            collected_sentences.append(sentence)
         broadcast({
             "type": "transcript",
             "text": sentence,
@@ -231,8 +337,10 @@ def _speak_stream_broadcast(generator_func, *args) -> None:
         _stream_started.set()
     try:
         voice_mcp.speak_stream(generator_func(*args), on_sentence=_on_sentence)
-    except Exception as e:
-        log.error("Stream broadcast error: %s", e)
+        if collected_sentences and len(args) > 0 and isinstance(args[0], str):
+            fact_extractor.process_turn_async(args[0], " ".join(collected_sentences))
+    except BaseException as e:
+        _log_action_error(e, getattr(generator_func, "__name__", "action"))
         speak("I encountered an error, sir.")
 
 
@@ -282,11 +390,16 @@ def _speak_during_act(func, speak_text: str, *args) -> None:
 
     def _do() -> None:
         try:
-            result = func(*args)
-        except Exception as e:
-            log.error("Action error: %s", e)
-            _record_error(e, getattr(func, "__name__", "action"))
-            _try_self_heal(str(e), getattr(func, "__name__", "action"))
+            try:
+                result = func(*args)
+            except TypeError as te:
+                if "exceptions must derive from BaseException" in str(te):
+                    raise Exception("nope") from te
+                raise
+        except BaseException as e:
+            exc = _log_action_error(e, getattr(func, "__name__", "action"))
+            _record_error(exc, getattr(func, "__name__", "action"))
+            _try_self_heal(str(exc), getattr(func, "__name__", "action"))
             _ack_once()
             return
         _speak_result(result)
@@ -315,11 +428,16 @@ def _task_action(func, speak_text: str, *args) -> None:
     """
     def _do():
         try:
-            func(*args)
-        except Exception as e:
-            log.error("Action error: %s", e)
-            _record_error(e, getattr(func, "__name__", "action"))
-            _try_self_heal(str(e), getattr(func, "__name__", "action"))
+            try:
+                func(*args)
+            except TypeError as te:
+                if "exceptions must derive from BaseException" in str(te):
+                    raise Exception("nope") from te
+                raise
+        except BaseException as e:
+            exc = _log_action_error(e, getattr(func, "__name__", "action"))
+            _record_error(exc, getattr(func, "__name__", "action"))
+            _try_self_heal(str(exc), getattr(func, "__name__", "action"))
         finally:
             broadcast_tasks()
     threading.Thread(target=_do, daemon=True).start()
@@ -374,6 +492,47 @@ def _handle_fix_error(cmd: str) -> None:
             speak("I could not diagnose that automatically, sir.")
     else:
         speak("No recent errors to fix, sir.")
+
+
+def _handle_run_skill(skill_name: str) -> None:
+    """Execute a skill from the skill manager."""
+    name = (skill_name or "").strip().lower().replace(" ", "_")
+    if not name:
+        speak("Which skill would you like me to run, sir?")
+        return
+    res = skill_manager.execute_skill(name)
+    if not res.get("ok"):
+        speak(f"I could not run {name}, sir: {res.get('error', 'unknown error')}")
+        return
+    if res.get("type") == "pipeline":
+        speak(f"Skill {name} completed successfully, sir.")
+    else:
+        desc = res.get("description") or "instructions loaded"
+        speak(f"Skill {name} activated, sir: {desc}")
+
+
+def _handle_self_review() -> None:
+    """Report on the assistant's own code and behaviour. Runs in the background."""
+    try:
+        report = evolution_mcp.handle("self review", "")
+        speak(report or "I looked myself over, sir.")
+    except Exception as e:
+        log.error("Self-review failed: %s", e)
+        speak("I could not complete the review, sir.")
+
+
+def _handle_evolve() -> None:
+    """Run one self-evolution cycle. Runs in the background."""
+    try:
+        result = evolution_mcp.run_cycle(trigger="command")
+        if result.get("ok"):
+            speak(f"I have a change ready for your approval, sir: "
+                  f"{result.get('summary', '')}")
+        else:
+            speak(f"I looked myself over, sir. {result.get('reason', 'Nothing to do.')}")
+    except Exception as e:
+        log.error("Evolution cycle failed: %s", e)
+        speak("I could not complete the review, sir.")
 
 
 def _clean_news(raw: str) -> str:
@@ -718,6 +877,25 @@ _ACTION_PATTERNS = [
     (r"^tell\s+me\s+(?:about\s+)?(?:you|your(?:s|self)?)$", "about"),
     (r"^what\s+can\s+you\s+do$", "about"),
     (r"^(?:cancel|never\s?mind|forget\s?(?:it|that)|nvm)$", "cancel"),
+    # --- HUD panels. The side panels are hidden until they are asked for, so
+    # --- these have to sit above the generic "show ..." rules further down,
+    # --- which would otherwise read "show panels" as the name of a file.
+    (r"^(?:can\s+you\s+)?(?:please\s+)?(?:show|display|open|bring\s+up)\s+(?:me\s+)?(?:the\s+)?(?:side\s+|side\s+?bar\s+)?panels?$", "show_panels"),
+    (r"^(?:can\s+you\s+)?(?:please\s+)?(?:show|display|open|bring\s+up)\s+(?:me\s+)?(?:the\s+)?(?:sidebar|side\s+bar|dashboard|system\s+metrics|metrics|readouts?|readings?|everything)$", "show_panels"),
+    (r"^(?:can\s+you\s+)?(?:please\s+)?(?:hide|close|dismiss|collapse|get\s+rid\s+of)\s+(?:me\s+)?(?:the\s+)?(?:side\s+)?panels?$", "hide_panels"),
+    (r"^(?:can\s+you\s+)?(?:please\s+)?(?:hide|close|dismiss|collapse|get\s+rid\s+of)\s+(?:me\s+)?(?:the\s+)?(?:sidebar|side\s+bar|dashboard|system\s+metrics|metrics|readouts?|readings?|everything)$", "hide_panels"),
+    # --- Self-evolution. These sit with the panel rules rather than at the end
+    # --- of the table, because the generic "list ..." and "show ..." rules
+    # --- further down would otherwise read "list proposals" as a request to
+    # --- list a file called "proposals".
+    (r"^(?:can\s+you\s+)?(?:please\s+)?(?:self[\s-]?review|review\s+yourself|analy[sz]e\s+yourself|check\s+yourself)$", "self_review"),
+    (r"^(?:can\s+you\s+)?(?:please\s+)?(?:evolve|improve\s+yourself|fix\s+yourself|self[\s-]?improve(?:ment)?)$", "evolve"),
+    (r"^(?:evolution|self[\s-]?evolution)\s+(?:status|report|summary)$", "evolution_status"),
+    (r"^(?:show|list|view)\s+(?:me\s+)?(?:the\s+)?(?:evolution\s+)?proposals?$", "show_proposals"),
+    (r"^(?:show|list|view)\s+(?:me\s+)?(?:the\s+)?(?:pending\s+)?(?:changes|evolution)$", "show_proposals"),
+    (r"^(?:approve|accept|apply)\s+(?:the\s+)?(?:evolution|change|proposal)\s+(.+)$", "approve_evolution"),
+    (r"^(?:reject|decline|refuse)\s+(?:the\s+)?(?:evolution|change|proposal)\s+(.+)$", "reject_evolution"),
+    (r"^(?:revert|undo|roll\s*back)\s+(?:the\s+)?(?:evolution|change|proposal)\s+(.+)$", "revert_evolution"),
     # Power commands. These used to share one pattern that mapped "shut down"
     # and "restart" to *sleep*, so each verb now has its own target.
     # Spotify - must come BEFORE generic "open" and "play" to match correctly.
@@ -866,6 +1044,10 @@ _ACTION_PATTERNS = [
     (r"^(?:can\s+you\s+)?(?:please\s+)?(?:no\s+)?close\s+(?:the\s+)?(?:window|app|this)$", "close_window"),
     (r"^(?:can\s+you\s+)?(?:please\s+)?(?:no\s+)?close\s+(?:the\s+)?(?:browser\s+)?tab$", "close_tab"),
     (r"^(?:can\s+you\s+)?(?:please\s+)?(?:no\s+)?close\s+this\s+tab$", "close_tab"),
+    # Closing an app by name. The verb list deliberately excludes "stop", and
+    # media nouns are excluded, so "stop the music" still pauses playback via
+    # the media rules below instead of being read as an app called "music".
+    (r"^(?:can\s+you\s+)?(?:please\s+)?(?:close|quit|exit)\s+(?:the\s+)?(?:app\s+)?(?!music\b|song\b|track\b|volume\b|sound\b|audio\b)(.+?)\s*(?:for\s+me)?$", "close_app"),
     (r"^(?:can\s+you\s+)?(?:please\s+)?focus\s+(?:on\s+)?(.+)$", "focus_window"),
     (r"^(?:can\s+you\s+)?(?:please\s+)?(?:show|list|what(?:'s| are))\s+(?:the\s+)?windows?$", "list_windows"),
     # Process management
@@ -969,6 +1151,11 @@ _ACTION_PATTERNS = [
     # distinguished from the media mute above.
     (r"^(?:can\s+you\s+)?(?:please\s+)?(?:mute|silence)\s+(?:the\s+)?(?:system\s+|master\s+)?(?:volume|sound|audio)$", "volume_mute"),
     (r"^(?:can\s+you\s+)?(?:please\s+)?(?:unmute|unsilence)\s+(?:the\s+)?(?:system\s+|master\s+)?(?:volume|sound|audio)$", "volume_unmute"),
+    # Skills (OpenJarvis)
+    (r"^(?:run|execute|start)\s+skill\s+(.+)$", "run_skill"),
+    (r"^(?:run|execute|start)\s+(?:the\s+)?(?:morning\s+digest|daily\s+briefing)$", "run_skill"),
+    (r"^(?:run|execute|start)\s+(?:the\s+)?(?:system\s+diagnostics|system\s+health\s+check)$", "run_skill"),
+    (r"^(?:list|show|what\s+are\s+your)\s+skills$", "list_skills"),
 ]
 
 ACTION_MAP = {name: regex for regex, name in _ACTION_PATTERNS}
@@ -1049,6 +1236,14 @@ def _llm_parse_command(cmd: str) -> Optional[tuple[str, str]]:
     if cached is not None:
         log.debug("LLM parse: cache hit for '%s' -> %s", key, cached[0])
         return cached
+
+    # An offline core can only answer in prose, which no amount of parsing can
+    # turn into a route. Attempting it anyway is what logged a parse error on
+    # every utterance while the client was known-missing.
+    if not llm_mcp.available:
+        log.debug("LLM parse skipped: core unavailable (%s)",
+                  llm_mcp.get_status().get("error") or "not configured")
+        return None
 
     try:
         prompt = build_routing_prompt(cmd)
@@ -1210,10 +1405,24 @@ def _handle_command_inner(cmd: str, memory: dict) -> None:
     if action:
         action_type, payload = action
 
+        verdict = loop_guard.check_call(action_type, payload)
+        if verdict.blocked:
+            log.warning("Command blocked by LoopGuard: %s (%s)", action_type, verdict.reason)
+            speak(f"I have paused that operation, sir: {verdict.reason}")
+            return
+
         # Quick responses - speak immediately
         if action_type == "cancel":
             voice_mcp.interrupt()
             speak("Understood. Command cancelled, sir.")
+            return
+        elif action_type == "show_panels":
+            set_panels(True)
+            speak("Panels displayed, sir.")
+            return
+        elif action_type == "hide_panels":
+            set_panels(False)
+            speak("Panels hidden, sir.")
             return
         elif action_type == "time":
             n = datetime.now()
@@ -1330,7 +1539,8 @@ JARVIS:"""
             speak("Back to JARVIS, sir.")
             return
         elif action_type == "open_app":
-            _speak_during_act(automation_mcp.open_app, f"Opening {payload}...", payload)
+            target = clean_app_name(payload) or payload
+            _speak_during_act(automation_mcp.open_app, f"Opening {target}...", payload)
             return
         elif action_type == "open_website":
             _speak_during_act(browser_mcp.open, f"Opening {payload}...", payload)
@@ -1525,6 +1735,10 @@ JARVIS:"""
         elif action_type == "close_window":
             _speak_during_act(automation_mcp.close_window, "Closing window...")
             return
+        elif action_type == "close_app":
+            target = clean_app_name(payload) or payload
+            _speak_during_act(automation_mcp.close_app, f"Closing {target}...", payload)
+            return
         elif action_type == "close_tab":
             def _close_tab():
                 import pyautogui
@@ -1668,6 +1882,43 @@ JARVIS:"""
             _handle_fix_error(cmd)
             return
 
+        # --- Self-evolution. A review is slow (it runs the tests), so it goes
+        # --- to the background; everything else answers straight away.
+        elif action_type == "self_review":
+            threading.Thread(target=_handle_self_review, daemon=True).start()
+            speak("I will look myself over, sir.")
+            return
+        elif action_type == "evolve":
+            threading.Thread(target=_handle_evolve, daemon=True).start()
+            speak("I will review myself and bring you something to approve, sir.")
+            return
+        elif action_type == "evolution_status":
+            speak(evolution_mcp.handle("evolution status", payload) or "")
+            return
+        elif action_type == "show_proposals":
+            speak(evolution_mcp.handle("show proposals", payload) or "")
+            return
+        elif action_type == "approve_evolution":
+            speak(evolution_mcp.handle("approve evolution", payload) or "")
+            return
+        elif action_type == "reject_evolution":
+            speak(evolution_mcp.handle("reject evolution", payload) or "")
+            return
+        elif action_type == "revert_evolution":
+            speak(evolution_mcp.handle("revert evolution", payload) or "")
+            return
+        elif action_type == "run_skill":
+            threading.Thread(target=_handle_run_skill, args=(payload,), daemon=True).start()
+            return
+        elif action_type == "list_skills":
+            skills = skill_manager.list_skills()
+            if not skills:
+                speak("No custom skills are currently installed, sir.")
+            else:
+                names = ", ".join(s["name"] for s in skills)
+                speak(f"I have {len(skills)} skills available, sir: {names}.")
+            return
+
         # Network-dependent - non-blocking
         elif action_type == "weather":
             threading.Thread(target=_fetch_and_respond, args=("weather", payload), daemon=True).start()
@@ -1733,11 +1984,21 @@ if STATIC_DIR.is_dir():
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 
+# Close codes a browser sends when the tab is simply closed, reloaded, or
+# navigated away: normal, going away, no status frame, and abnormal closure
+# (a tab close sends no close frame). These were logged as warnings, which
+# buried real faults under ~80 noise lines per session.
+_NORMAL_WS_CLOSE_CODES = (1000, 1001, 1005, 1006)
+
+
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     with _ws_lock:
         _websocket_clients.append(websocket)
+    # Tell the client where the panels stand, so a reload of the tab comes
+    # back the way the user left it.
+    await websocket.send_text(json.dumps({"type": "panels", "visible": _panels_visible}))
     log.info("WebSocket client connected.")
     try:
         while True:
@@ -1762,6 +2023,11 @@ async def websocket_endpoint(websocket: WebSocket):
                                "listening": voice_mcp.is_listening()})
             except json.JSONDecodeError:
                 pass
+    except WebSocketDisconnect as e:
+        if e.code in _NORMAL_WS_CLOSE_CODES:
+            log.info("WebSocket client went away (code %s).", e.code)
+        else:
+            log.warning("WebSocket closed unexpectedly: %s", e)
     except Exception as e:
         log.warning("WebSocket error: %s", e)
     finally:
@@ -1797,10 +2063,82 @@ async def api_tasks():
     return {"tasks": tasks_mcp.get_tasks_for_ui()}
 
 
+@app.get("/api/evolution")
+async def api_evolution():
+    """The state of the self-evolution module and any pending proposals."""
+    return {
+        "status": evolution_mcp.get_status(),
+        "proposals": evolution_mcp.get_proposals(),
+        "lessons": evolution_mcp.get_lessons()[-10:],
+    }
+
+
+@app.post("/api/evolution/{proposal_id}")
+async def api_evolution_decide(proposal_id: str, action: str = "approve"):
+    """Approve, reject or undo a proposal the assistant made for itself."""
+    if action == "approve":
+        ok, message = evolution_mcp.approve(proposal_id)
+    elif action == "reject":
+        ok, message = evolution_mcp.reject(proposal_id)
+    elif action == "revert":
+        ok, message = evolution_mcp.revert(proposal_id)
+    else:
+        return JSONResponse({"ok": False, "message": "unknown action"}, status_code=400)
+    return {"ok": ok, "message": message}
+
+
 @app.get("/api/metrics")
 async def api_metrics():
     """One-shot system metrics, shaped for the HUD."""
     return system_mcp.get_ui_metrics()
+
+
+@app.get("/api/cosmos")
+async def api_cosmos():
+    """The neural galaxy: one particle per memory, skill, ability, and mission.
+
+    Skills are the actions the model is allowed to route to; abilities are the
+    privileged actions it is not, so the HUD can show them as a separate ring.
+    Memories are de-duplicated because the store can accumulate repeats.
+    """
+    unique_memories = {}
+    for entry in memory_mcp.get_facts():
+        fact = (entry.get("fact") or "").strip()
+        if not fact:
+            continue
+        key = fact.lower()
+        current = unique_memories.get(key)
+        if current is None or entry.get("timestamp", "") >= current.get("timestamp", ""):
+            unique_memories[key] = {"fact": fact, "timestamp": entry.get("timestamp", "")}
+    memories = sorted(unique_memories.values(),
+                      key=lambda m: m.get("timestamp", ""), reverse=True)
+
+    skills = [
+        {"name": name, "description": description}
+        for name, description in sorted(ACTION_CATALOGUE.items())
+        if is_routable(name)
+    ]
+    abilities = [
+        {"name": name, "description": description}
+        for name, description in sorted(ACTION_CATALOGUE.items())
+        if not is_routable(name)
+    ]
+    tasks = tasks_mcp.get_tasks_for_ui()
+    pending = [t for t in tasks if not t.get("done")]
+
+    return {
+        "identity": memory_mcp.get_identity(),
+        "memories": memories,
+        "skills": skills,
+        "abilities": abilities,
+        "tasks": tasks,
+        "stats": {
+            "memories": len(memories),
+            "skills": len(skills),
+            "abilities": len(abilities),
+            "missions": len(pending),
+        },
+    }
 
 
 @app.get("/api/tts")
@@ -1870,8 +2208,17 @@ def _metrics_loop(interval: float = 2.0) -> None:
     while not _shutdown.is_set():
         try:
             if _websocket_clients:
-                broadcast({"type": "metrics", **system_mcp.get_ui_metrics()})
+                broadcast({
+                    "type": "metrics",
+                    **system_mcp.get_ui_metrics(),
+                    # The microphone is always on, so the HUD can say so.
+                    "listening": voice_mcp.is_listening(),
+                })
             broadcast_tasks()
+            try:
+                _broadcast_voice_down_if_needed()
+            except Exception:
+                pass
         except Exception as e:
             log.debug("Metrics loop error: %s", e)
         _shutdown.wait(interval)
@@ -1911,7 +2258,14 @@ def main():
     if not chrome_found:
         log.info("Chrome not found, using default browser")
         webbrowser.open("http://127.0.0.1:8765")
-    
+
+    # The greeting is spoken after the microphone has finished measuring the
+    # room. Playback bleeds back into the mic, and calibrating while the
+    # speaker was talking measured that sound as "room noise" and set the
+    # speech gate far too high for the rest of the session.
+    if voice_mcp.is_listening() and not voice_mcp.wait_for_calibration(15.0):
+        log.warning("Room calibration did not finish before speaking the greeting.")
+
     _say_async("Good to see you, sir.")
     
     log.info("System ready. Press Ctrl+C to exit.")

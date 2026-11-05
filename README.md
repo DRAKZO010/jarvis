@@ -159,6 +159,13 @@ than performed: Jarvis says which voice it is actually using instead of
 accepting the change and then speaking in the old one anyway. `"set voice X"`
 sets `FISH_VOICE_ID` for the rest of the session.
 
+If replies are too quiet, check the Windows volume for the endpoint on the
+speaker icon first — that is the usual cause, not the TTS. As a software boost,
+set `JARVIS_TTS_GAIN` to anything from `0.1` to `10.0` (`1.0` is unchanged);
+loud peaks are clipped rather than distorted. The output device is never a
+Bluetooth hands-free endpoint: those open fine but play at call quality and
+volume, which sounds like a broken speaker.
+
 ### Voice input
 
 Speech is transcribed locally by Vosk, so nothing leaves the machine. There are

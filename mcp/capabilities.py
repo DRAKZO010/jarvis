@@ -34,6 +34,8 @@ ACTION_CATALOGUE: dict[str, str] = {
     "cancel_shutdown": "Cancel a scheduled shutdown or restart.",
     "recall": "Repeat or recall your last spoken reply.",
     "remember": "Store a fact the user wants kept (payload is the fact).",
+    "run_skill": "Execute an installed skill procedure or pipeline. Payload is the skill name, like morning digest or deep research.",
+    "list_skills": "List all installed skills.",
     "fix_error": "Diagnose a recent error in the app.",
 
     # --- time / information --------------------------------------------
@@ -110,6 +112,7 @@ ACTION_CATALOGUE: dict[str, str] = {
     "minimize_window": "Minimise the focused window.",
     "close_window": "Close the focused window.",
     "close_tab": "Close the current browser tab.",
+    "close_app": "Close an application by name. Payload is the app name, e.g. 'spotify'.",
 
     # --- files -------------------------------------------------------------
     "read_file": "Read and show the contents of a file. Payload is the path.",
@@ -135,6 +138,24 @@ ACTION_CATALOGUE: dict[str, str] = {
     "set_voice": "Change the speaking voice. Payload is the voice name.",
     "voice_backend": "Report which speech backend is active. Payload names a "
                       "backend to check against the one that is in use.",
+
+    # --- HUD -----------------------------------------------------------------
+    "show_panels": "Show the assistant's side panels in the display window.",
+    "hide_panels": "Hide the assistant's side panels and show only the core.",
+
+    # --- self-evolution (blocked for the model; see below) -------------------
+    "self_review": "Review the assistant's own code and recent behaviour, and "
+                   "report anything that looks wrong.",
+    "evolve": "Ask the assistant to review its own code and propose a fix. The "
+              "change is sandboxed and waits for the operator to approve it.",
+    "evolution_status": "Report how many self-review cycles have run, how many "
+                        "changes are waiting for approval, and what was found.",
+    "show_proposals": "List the changes waiting for the operator to approve.",
+    "approve_evolution": "Apply a proposed change to the code. Payload is the "
+                          "proposal id.",
+    "reject_evolution": "Turn down a proposed change. Payload is the proposal id.",
+    "revert_evolution": "Undo a change that was applied earlier. Payload is the "
+                         "proposal id.",
 
     # --- power (blocked for the model; see below) ----------------------------
     "lock_pc": "Lock the computer.",
@@ -176,6 +197,13 @@ LLM_ROUTABLE_ACTIONS: frozenset[str] = frozenset(ACTION_CATALOGUE) - {
     "shutdown_pc",
     "restart_pc",
     "fix_error",
+    # Self-evolution: a cycle costs a full test run, and an approval is the
+    # one decision that must never be made by the thing being supervised.
+    "self_review",
+    "evolve",
+    "approve_evolution",
+    "reject_evolution",
+    "revert_evolution",
 }
 
 

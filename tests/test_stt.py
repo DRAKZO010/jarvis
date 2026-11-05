@@ -19,6 +19,7 @@ from mcp.voice import (
     VAD_BLOCK,
     UtteranceSegmenter,
     VoiceMCP,
+    _model_path_to_load,
     strip_wake_word,
 )
 
@@ -114,6 +115,74 @@ def test_flush_returns_a_pending_utterance():
     feed(seg, SPEECH, 600)
     out = seg.flush()
     assert out is not None and len(out) > 0
+
+
+def test_trailing_silence_is_trimmed_from_the_utterance():
+    """The pause that ends an utterance is not worth decoding."""
+    seg = UtteranceSegmenter(silence_ms=1000, tail_ms=300)
+    feed(seg, SPEECH, 600)
+    out = feed(seg, SILENT, 1000)[0]
+    assert out is not None
+    # 600 ms of speech plus at most the 300 ms tail.
+    assert len(out) <= (900 * 16000 // 1000) * 2 + 4
+
+
+def test_the_lead_in_survives_the_trim():
+    """Trimming the tail must not clip the syllable that starts the utterance."""
+    seg = UtteranceSegmenter(silence_ms=1000, pre_roll_ms=500, tail_ms=300)
+    feed(seg, SILENT, 500)
+    out = feed(seg, SPEECH, 400)
+    out += feed(seg, SILENT, 1500)
+    assert out, "the utterance did not form"
+    assert SPEECH in out[0]
+
+
+def test_a_noise_burst_is_not_transcribed():
+    """A short loud blip is not speech, and decoding it costs real CPU."""
+    seg = UtteranceSegmenter(silence_ms=500, min_speech_ms=1000)
+    feed(seg, SPEECH, 200)
+    assert feed(seg, SILENT, 1500) == [], "a burst of noise was treated as speech"
+
+
+# --- the model without its neural rescorer ----------------------------------
+
+def _fake_model(tmp_path):
+    """A model folder shaped like the real one, with a rescorer in it."""
+    model = tmp_path / "model"
+    (model / "am").mkdir(parents=True)
+    (model / "graph").mkdir()
+    (model / "conf").mkdir()
+    (model / "ivector").mkdir()
+    (model / "rescore").mkdir()
+    (model / "am" / "final.mdl").write_bytes(b"am")
+    (model / "graph" / "HCLG.fst").write_bytes(b"fst")
+    (model / "rescore" / "rnnlm").write_bytes(b"rnnlm")
+    return model
+
+
+def test_the_model_is_loaded_without_the_neural_rescorer(tmp_path, monkeypatch):
+    """The rescorer costs seven times the decoding time and nearly two gigs."""
+    monkeypatch.delenv("JARVIS_VOSK_RNNLM", raising=False)
+    model = _fake_model(tmp_path)
+    chosen = _model_path_to_load(model)
+    assert chosen != model, "the rescorer was left in the model"
+    assert not (chosen / "rescore").exists()
+    assert (chosen / "graph").is_dir() and (chosen / "am").is_dir()
+
+
+def test_the_rescorer_can_be_asked_for(tmp_path, monkeypatch):
+    monkeypatch.setenv("JARVIS_VOSK_RNNLM", "1")
+    model = _fake_model(tmp_path)
+    assert _model_path_to_load(model) == model
+
+
+def test_a_model_without_a_rescorer_is_left_alone(tmp_path, monkeypatch):
+    """Most Vosk models have no rescorer, and they must still load."""
+    monkeypatch.delenv("JARVIS_VOSK_RNNLM", raising=False)
+    model = tmp_path / "model"
+    (model / "am").mkdir(parents=True)
+    (model / "graph").mkdir()
+    assert _model_path_to_load(model) == model
 
 
 def test_flush_is_idempotent():
@@ -374,6 +443,74 @@ def test_finish_utterance_does_not_refeed_audio(voice, monkeypatch):
     voice._finish_utterance(rec)
     assert rec.fed == [SPEECH], "utterance audio was fed to the recognizer twice"
     assert heard == ["what time is it"]
+
+
+def test_finish_utterance_feeds_the_utterance_it_was_given(voice, monkeypatch):
+    """When the caller hands over the utterance, that audio must be transcribed."""
+    heard = _capture_hook(monkeypatch)
+    rec = FakeRecognizer("jarvis what time is it")
+    voice._finish_utterance(rec, utterance=SPEECH)
+    assert rec.fed == [SPEECH]
+    assert heard == ["what time is it"]
+
+
+def test_room_tone_never_reaches_the_recognizer(voice, monkeypatch):
+    """Vosk runs its acoustic model on every frame it is fed.
+
+    Feeding it the room tone costs a third of a CPU core on a machine that is
+    only ever silent, so the capture loop must hand it speech and nothing else.
+    """
+    heard = _capture_hook(monkeypatch)
+    rec = FakeRecognizer("jarvis show panels")
+    seg = UtteranceSegmenter(sample_rate=16000, block=480, threshold=0.0013,
+                             silence_ms=1200, pre_roll_ms=500)
+    captured = 0
+    for _ in range(300):         # nine seconds of room tone
+        block = SILENT
+        level = seg.rms(block)
+        seg.push(block, level)
+        captured += len(block)
+    for _ in range(20):          # the wake word and the command
+        block = SPEECH
+        level = seg.rms(block)
+        seg.push(block, level)
+        captured += len(block)
+    for _ in range(45):          # the pause that ends the utterance
+        block = SILENT
+        level = seg.rms(block)
+        utterance = seg.push(block, level)
+        captured += len(block)
+        if utterance:
+            voice._finish_utterance(rec, utterance=utterance)
+            rec.Reset()
+    assert rec.fed, "the recognizer never heard the command"
+    assert heard == ["show panels"]
+    fed = b"".join(rec.fed)
+    assert SPEECH in fed, "the command never reached the recognizer"
+    # Only the utterance (plus its short lead-in) may reach the recognizer.
+    assert len(fed) < captured / 3, (
+        "the recognizer was fed %d of %d captured bytes: the room tone leaked in"
+        % (len(fed), captured))
+
+
+def test_segmenter_uses_a_precomputed_level():
+    """The capture loop measures a block once; the segmenter must not re-measure."""
+    seg = UtteranceSegmenter(sample_rate=16000, block=480, threshold=0.0013)
+    assert seg.push(SPEECH, seg.rms(SPEECH)) is None  # still inside the utterance
+    assert seg.push(SILENT, 0.0) is None               # measured level honoured
+    assert seg.rms(SPEECH) == pytest.approx(UtteranceSegmenter.rms(SPEECH))
+
+
+def test_rms_matches_a_plain_reference_loop():
+    """The array-based RMS must agree with the obvious implementation."""
+    def reference(data):
+        samples = array.array("h")
+        samples.frombytes(data)
+        total = sum(s * s for s in samples)
+        return (total / len(samples)) ** 0.5 / 32768.0
+
+    for data in (SILENT, SPEECH, tone(2000), tone(16000), b"\x01\x02\x03\x04"):
+        assert UtteranceSegmenter.rms(data) == pytest.approx(reference(data))
 
 
 def test_wake_word_utterance_is_dispatched(voice, monkeypatch):
@@ -708,7 +845,8 @@ def _run_loop(voice, monkeypatch, blocks, fake=None):
 
 def test_capture_loop_converts_buffers_to_bytes(voice, monkeypatch):
     """Regression: a cffi buffer from sounddevice used to break every block."""
-    rec, opened = _run_loop(voice, monkeypatch, [SPEECH] * 6)
+    # Speech long enough to clear the minimum, then the pause that ends it.
+    rec, opened = _run_loop(voice, monkeypatch, [SPEECH] * 12 + [SILENT] * 45)
     assert rec.seen, "nothing reached the recogniser"
     assert all(isinstance(d, bytes) for d in rec.seen)
     assert b"".join(rec.seen).startswith(SPEECH)
@@ -862,7 +1000,9 @@ def test_quiet_microphone_level_would_have_been_ignored():
 
 def _stub_blocks(voice, rms_values):
     """Feed the calibrator a fixed sequence of block RMS values."""
-    voice._probe_input_blocks = lambda sd, device, seconds=0.0: list(rms_values)
+    voice._probe_input_blocks = (
+        lambda sd, device, seconds=0.0, skip_speaking=False: list(rms_values)
+    )
 
 
 def test_threshold_follows_the_noise_floor(voice, monkeypatch):
@@ -925,6 +1065,49 @@ def test_speech_during_calibration_is_not_mistaken_for_noise(voice, monkeypatch)
     assert voice.vad_threshold <= baseline * 1.5, (
         f"gate rose to {voice.vad_threshold} from {baseline} because the user "
         "spoke during calibration")
+
+
+def test_jarvis_speaking_is_not_measured_as_room_noise(voice, monkeypatch):
+    """The startup greeting must not raise the gate it is calibrated next to.
+
+    A real first run measured 0.0217 of "room noise" while the greeting was
+    playing and set the gate to 0.033; a restart in the same room measured
+    0.00066. Those loud blocks belong to JARVIS, not the room.
+    """
+    monkeypatch.delenv("JARVIS_VAD_THRESHOLD", raising=False)
+    reads = {"n": 0}
+
+    class SpeakingStream:
+        def __init__(self):
+            self.blocks = [0.4] * 3 + [0.0007] * 8
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def read(self, count):
+            if not self.blocks:
+                return memoryview(b""), False
+            level = self.blocks.pop(0)
+            reads["n"] += 1
+            # The first blocks are JARVIS's own greeting.
+            voice._is_speaking = reads["n"] <= 3
+            return memoryview(tone(int(level * 32767))), False
+
+    class FakeSD:
+        def RawInputStream(self, **kwargs):
+            return SpeakingStream()
+
+    voice._calibrate_vad(FakeSD(), 0)
+
+    assert voice._noise_floor is not None
+    assert voice._noise_floor < 0.001, (
+        "calibration measured JARVIS's own speech as the room: "
+        f"{voice._noise_floor}")
+    assert voice._vad_warning is None
+    assert voice.wait_for_calibration(0.1), "calibration never signalled done"
 
 
 def test_quiet_voice_is_admitted_on_this_hardware(voice, monkeypatch):

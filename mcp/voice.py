@@ -8,10 +8,14 @@ import logging
 import os
 import queue
 import re
+import shutil
+import subprocess
+import sys
 import tempfile
 import threading
 import time
 from collections import deque
+from operator import mul
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -92,6 +96,10 @@ VAD_NOISE_PERCENTILE = 0.25
 # on the percentile being read and the gate came out anywhere between 0.002 and
 # 0.044. At 30ms blocks, 2.5s is about 83 frames.
 VAD_CALIBRATE_S = 2.5
+# Extra time the calibrator may take when JARVIS is speaking during the probe.
+# Its own voice is not the room, so those blocks are skipped and the window is
+# extended rather than letting the greeting raise the gate for the session.
+VAD_SPEAKING_SKIP_S = 8.0
 
 # While the assistant is speaking, its own output leaks into the microphone, so
 # the gate is raised to keep it from answering itself. The margin is a modest
@@ -129,6 +137,13 @@ MAX_PROBE_DEVICES = 12
 # a candidate is only used if it also opens successfully.
 OUTPUT_HEADSET_HINTS = ("headphone", "headset", "earphone", "earbud",
                         "airpod", "buds")
+# Bluetooth telephony endpoints open successfully but play at call quality and
+# low level, which reads as "the speaker is broken". They are never chosen.
+OUTPUT_HANDSFREE_HINTS = ("hands-free", "hands free", "hf audio", "ag audio")
+# Bounds for JARVIS_TTS_GAIN: 0.1 could silence the assistant and above 10x a
+# stray typo distorts every reply.
+TTS_GAIN_MIN = 0.1
+TTS_GAIN_MAX = 10.0
 # A stream this short is enough to make a dead endpoint fail and costs nothing
 # on a live one.
 OUTPUT_PROBE_SR = 22050
@@ -156,6 +171,7 @@ class UtteranceSegmenter:
         min_speech_ms: int = 300,
         max_utterance_s: float = 12.0,
         pre_roll_ms: int = 500,
+        tail_ms: int = 300,
     ):
         self.sample_rate = sample_rate
         self.block = block
@@ -173,6 +189,11 @@ class UtteranceSegmenter:
         self._pre_roll: List[bytes] = []
         self._quiet_run = 0
         self._in_speech = False
+        # How many blocks of this utterance actually cleared the gate, and
+        # where the last of them ended in the buffer.
+        self._above_blocks = 0
+        self._speech_end = 0
+        self.tail_ms = tail_ms
 
     @staticmethod
     def rms(data: bytes) -> float:
@@ -182,11 +203,14 @@ class UtteranceSegmenter:
         count = len(data) // 2
         if count == 0:
             return 0.0
-        total = 0
-        for i in range(0, count * 2, 2):
-            sample = int.from_bytes(data[i:i + 2], "little", signed=True)
-            total += sample * sample
-        return (total / count) ** 0.5 / 32768.0
+        samples = array.array("h")
+        samples.frombytes(data[: count * 2])
+        if sys.byteorder == "big":
+            samples.byteswap()
+        if not samples:
+            return 0.0
+        total = sum(map(mul, samples, samples))
+        return (total / len(samples)) ** 0.5 / 32768.0
 
     def _speech_blocks(self) -> int:
         return len(self._buffer) // (self.block * 2) if self.block else 0
@@ -194,9 +218,15 @@ class UtteranceSegmenter:
     def _block_count(self, utterance: bytes) -> int:
         return len(utterance) // (self.block * 2) if self.block else 0
 
-    def push(self, data: bytes) -> Optional[bytes]:
-        """Feed one block. Returns a complete utterance, or None."""
-        if self.rms(data) >= self.threshold:
+    def push(self, data: bytes, level: Optional[float] = None) -> Optional[bytes]:
+        """Feed one block. Returns a complete utterance, or None.
+
+        ``level`` is the block's RMS, when the caller has already computed it.
+        Pass it in rather than paying for the same measurement twice.
+        """
+        if level is None:
+            level = self.rms(data)
+        if level >= self.threshold:
             if not self._in_speech:
                 # Start on speech, but keep the preceding quiet blocks so the
                 # first syllable is not clipped off.
@@ -204,8 +234,11 @@ class UtteranceSegmenter:
                 self._buffer = bytearray(b"".join(self._pre_roll))
                 self._pre_roll.clear()
                 self._quiet_run = 0
+                self._above_blocks = 0
             self._buffer += data
             self._quiet_run = 0
+            self._above_blocks += 1
+            self._speech_end = len(self._buffer)
         elif self._in_speech:
             self._buffer += data
             self._quiet_run += 1
@@ -229,18 +262,98 @@ class UtteranceSegmenter:
             self._buffer = bytearray()
             self._pre_roll.clear()
             self._quiet_run = 0
+            self._above_blocks = 0
+            self._speech_end = 0
             return None
-        utterance = bytes(self._buffer)
+
+        # The silence that ended the utterance is of no use to the recognizer,
+        # and every second of it is a second of decoding. Keep a short tail so
+        # a word that trails the last loud block still has its ending.
+        tail = self.tail_ms * self.sample_rate // 1000 * 2
+        end = min(len(self._buffer), self._speech_end + tail)
+        utterance = bytes(self._buffer[:end])
+        above_blocks = self._above_blocks
+
         self._in_speech = False
         self._buffer = bytearray()
         self._pre_roll.clear()
         self._quiet_run = 0
-        if self._speech_blocks_len(utterance) < self.min_speech_blocks:
+        self._above_blocks = 0
+        self._speech_end = 0
+
+        # Only the loud part counts. A click, a door, or a passing fan that
+        # cleared the gate is not speech, and transcribing one would cost the
+        # decoder a full pass over the audio for nothing.
+        if above_blocks < self.min_speech_blocks:
             return None
         return utterance
 
     def _speech_blocks_len(self, utterance: bytes) -> int:
         return self._block_count(utterance)
+
+
+def _link_directory(target: Path, link: Path) -> bool:
+    """Make ``link`` point at ``target`` without copying anything."""
+    try:
+        os.symlink(target, link, target_is_directory=True)
+        return True
+    except (OSError, NotImplementedError, AttributeError, ValueError):
+        pass
+    if os.name == "nt":
+        try:
+            subprocess.run(
+                ["cmd", "/c", "mklink", "/J", str(link), str(target)],
+                check=True, capture_output=True,
+            )
+            return True
+        except Exception:
+            return False
+    return False
+
+
+def _model_path_to_load(model_path: Path) -> Path:
+    """The Vosk model to load, with or without its neural rescorer.
+
+    The callcenter model ships a recurrent language model in ``rescore/`` that
+    re-ranks the decoder's hypotheses after every utterance. Measured on this
+    machine it makes a decode of five seconds of speech take 6.4 seconds
+    instead of 0.8, and it holds 1.9 GB of the machine's memory open. What it
+    buys is spelling: the same sentence comes back with the last word
+    correctly pluralised. For an assistant that listens for commands that is
+    not a trade worth making on a laptop.
+
+    So the model is loaded through a view of the folder that leaves the
+    rescorer out, built out of links so nothing is copied and nothing in the
+    model is touched. ``JARVIS_VOSK_RNNLM=1`` puts the rescorer back.
+    """
+    if (os.environ.get("JARVIS_VOSK_RNNLM") or "").strip() in ("1", "true", "yes", "on"):
+        return model_path
+    if not (model_path / "rescore").is_dir():
+        return model_path
+
+    fast = model_path.parent / (model_path.name + "-fast")
+    if (fast / "graph").is_dir() and (fast / "am").is_dir():
+        return fast
+
+    try:
+        fast.mkdir()
+        for entry in model_path.iterdir():
+            if entry.name in ("rescore", "rnnlm"):
+                continue
+            if entry.is_dir():
+                if not _link_directory(entry, fast / entry.name):
+                    raise OSError("could not link %s" % entry.name)
+            else:
+                shutil.copy2(entry, fast / entry.name)
+    except Exception as e:
+        log.warning("Could not build the fast Vosk model view (%s); "
+                    "loading the model with its rescorer.", e)
+        shutil.rmtree(fast, ignore_errors=True)
+        return model_path
+
+    log.info("Vosk model loaded without the neural rescorer (JARVIS_VOSK_RNNLM=1 "
+             "to keep it).")
+    return fast
 
 
 def strip_wake_word(text: str, wake_word: str = "jarvis") -> tuple[bool, str]:
@@ -346,6 +459,9 @@ class VoiceMCP(MCPBase):
         self.vad_threshold = VAD_THRESHOLD
         self.speaking_threshold = VAD_THRESHOLD * VAD_SPEAKING_MULTIPLE
         self._noise_floor: Optional[float] = None
+        # Set once the room has been measured, so startup speech can wait for
+        # it instead of bleeding into the measurement.
+        self._calibrated = threading.Event()
         # Set when calibration found a room it cannot work in, so the HUD can
         # say so instead of the user concluding the assistant is ignoring them.
         self._vad_warning: Optional[str] = None
@@ -356,6 +472,10 @@ class VoiceMCP(MCPBase):
         self._blocks_above_gate = 0
         self._utterances_formed = 0
         self._input_gain = 1.0
+        # Software amplification for replies. Fish Audio's own level is healthy,
+        # but a quiet Windows endpoint (or quiet earbuds) is common enough that
+        # a boost the user can dial in beats editing the samples.
+        self.tts_gain = self._read_tts_gain()
         # Where replies play. None means "the system default output".
         self._output_device_cache: Optional[int] = None
         self._output_device_cached_at: float = 0.0
@@ -382,6 +502,32 @@ class VoiceMCP(MCPBase):
         # Vosk model
         self._vosk_model = None
 
+    @staticmethod
+    def _read_tts_gain() -> float:
+        """``JARVIS_TTS_GAIN``: software volume boost applied to every reply.
+
+        ``1.0`` leaves the audio untouched, which is the right default: Fish
+        Audio already arrives at a healthy level, and the usual cause of "too
+        quiet" is the Windows endpoint volume rather than the samples. Invalid
+        input warns and falls back, because a typo must not silence the
+        assistant.
+        """
+        raw = (os.environ.get("JARVIS_TTS_GAIN") or "").strip()
+        if not raw:
+            return 1.0
+        try:
+            gain = float(raw)
+        except ValueError:
+            log.warning("JARVIS_TTS_GAIN=%r is not a number; leaving replies "
+                        "unboosted.", raw)
+            return 1.0
+        if not (TTS_GAIN_MIN <= gain <= TTS_GAIN_MAX):
+            clamped = max(TTS_GAIN_MIN, min(TTS_GAIN_MAX, gain))
+            log.warning("JARVIS_TTS_GAIN=%.2f is outside %.1f-%.1f; clamped to "
+                        "%.2f.", gain, TTS_GAIN_MIN, TTS_GAIN_MAX, clamped)
+            return clamped
+        return gain
+
     def initialize(self) -> bool:
         """Initialize voice systems."""
         # Load Vosk model
@@ -389,7 +535,7 @@ class VoiceMCP(MCPBase):
         if HAS_VOSK and model_path.is_dir():
             try:
                 SetLogLevel(-1)
-                self._vosk_model = Model(str(model_path))
+                self._vosk_model = Model(str(_model_path_to_load(model_path)))
                 log.info("Vosk model loaded.")
             except Exception as e:
                 log.warning("Vosk load failed: %s", e)
@@ -664,11 +810,16 @@ class VoiceMCP(MCPBase):
             return False
 
         self._listener_stop.clear()
+        self._calibrated.clear()
         self._listener_thread = threading.Thread(
             target=self._listen_loop, name="jarvis-stt", daemon=True
         )
         self._listener_thread.start()
         return True
+
+    def wait_for_calibration(self, timeout: float = 15.0) -> bool:
+        """Block until the room has been measured, or the timeout expires."""
+        return self._calibrated.wait(timeout)
 
     def stop_listener(self) -> None:
         """Stop the capture thread. Safe to call when it was never started."""
@@ -826,8 +977,14 @@ class VoiceMCP(MCPBase):
         log.warning("No microphone carried any signal; falling back to the system default.")
         return None
 
-    def _probe_input_blocks(self, sd, device, seconds: float = 0.0) -> Optional[list]:
-        """Per-block RMS over a short window, or None if the device will not open."""
+    def _probe_input_blocks(self, sd, device, seconds: float = 0.0,
+                            skip_speaking: bool = False) -> Optional[list]:
+        """Per-block RMS over a short window, or None if the device will not open.
+
+        With ``skip_speaking`` the assistant's own playback is excluded: a
+        block captured while it is talking measures the speaker, not the room,
+        and the window is extended instead so the sample is still full.
+        """
         try:
             with sd.RawInputStream(
                 device=device,
@@ -837,17 +994,33 @@ class VoiceMCP(MCPBase):
                 channels=self.channels,
             ) as stream:
                 levels = []
+                block_s = VAD_BLOCK / float(self.sample_rate or 16000)
                 deadline = time.monotonic() + seconds
+                hard_deadline = deadline + VAD_SPEAKING_SKIP_S
                 while time.monotonic() < deadline:
                     data, _overflow = stream.read(VAD_BLOCK)
                     if not data:
                         break
+                    if skip_speaking and self._is_speaking:
+                        deadline = min(
+                            max(deadline, time.monotonic() + block_s),
+                            hard_deadline,
+                        )
+                        continue
                     levels.append(UtteranceSegmenter.rms(bytes(data)))
                 return levels or None
         except Exception:
             return None
 
     def _calibrate_vad(self, sd, device) -> None:
+        """Measure the room, then publish the result to waiting callers."""
+        self._calibrated.clear()
+        try:
+            self._calibrate_vad_inner(sd, device)
+        finally:
+            self._calibrated.set()
+
+    def _calibrate_vad_inner(self, sd, device) -> None:
         """Set the speech gate from the room's own noise level.
 
         Called once the input device is chosen. A single fixed threshold is
@@ -876,7 +1049,8 @@ class VoiceMCP(MCPBase):
             except ValueError:
                 log.warning("Ignoring invalid JARVIS_VAD_THRESHOLD=%r", override)
 
-        levels = self._probe_input_blocks(sd, device, VAD_CALIBRATE_S)
+        levels = self._probe_input_blocks(
+            sd, device, VAD_CALIBRATE_S, skip_speaking=True)
         if not levels:
             self._noise_floor = None
             self._vad_warning = None
@@ -964,7 +1138,10 @@ class VoiceMCP(MCPBase):
                             self._ptt_flush.clear()
                             pending = segmenter.flush()
                             if pending:
-                                self._finish_utterance(recognizer, allow_bare=True)
+                                self._finish_utterance(
+                                    recognizer, utterance=pending, allow_bare=True
+                                )
+                                recognizer.Reset()
 
                         data, _overflow = stream.read(VAD_BLOCK)
                         if not data:
@@ -992,11 +1169,16 @@ class VoiceMCP(MCPBase):
                             self._blocks_above_gate += 1
                             self._adapt_input_gain(level)
 
-                        recognizer.AcceptWaveform(self._gain_audio(data))
-                        utterance = segmenter.push(data)
+                        # The recognizer is deliberately NOT fed here. Vosk runs
+                        # its acoustic model on every accepted frame, so feeding
+                        # it the room tone costs a third of a CPU core for a
+                        # machine that is only ever silent. The segmenter
+                        # already decides where an utterance starts and ends,
+                        # so the recognizer only ever sees the speech itself.
+                        utterance = segmenter.push(data, level)
                         if utterance:
                             self._utterances_formed += 1
-                            self._finish_utterance(recognizer)
+                            self._finish_utterance(recognizer, utterance=utterance)
                             recognizer.Reset()
 
             except Exception as e:
@@ -1047,17 +1229,31 @@ class VoiceMCP(MCPBase):
             samples[i] = 32767 if scaled > 32767 else (-32768 if scaled < -32768 else scaled)
         return samples.tobytes()
 
-    def _finish_utterance(self, recognizer, allow_bare: bool = False) -> None:
+    def _finish_utterance(
+        self,
+        recognizer,
+        utterance: Optional[bytes] = None,
+        allow_bare: bool = False,
+    ) -> None:
         """Close the current utterance, recognise it, and dispatch if it counts.
 
-        The audio has already been streamed to the recognizer block by block,
-        so this only collects the result. Feeding the buffer again here would
-        transcribe every utterance twice.
+        ``utterance`` is the audio to transcribe. When it is given, it is fed to
+        the recognizer here and the recognizer only ever hears speech - the
+        listener deliberately does not stream room tone into it. When it is
+        None the audio has already been streamed to the recognizer block by
+        block, and this only collects the result.
 
         ``allow_bare`` accepts speech with no wake word, which is what
         push-to-talk needs on release: the button is already up by then, so the
         wake-word gate would otherwise throw the command away.
         """
+        if utterance:
+            try:
+                recognizer.AcceptWaveform(self._gain_audio(utterance))
+            except Exception as e:
+                log.warning("Recognition failed: %s", e)
+                return
+
         try:
             raw = recognizer.FinalResult()
         except Exception as e:
@@ -1232,6 +1428,8 @@ class VoiceMCP(MCPBase):
             name = str(dev.get("name", "")).lower()
             if not any(k in name for k in OUTPUT_HEADSET_HINTS):
                 continue
+            if any(k in name for k in OUTPUT_HANDSFREE_HINTS):
+                continue
             if self._output_device_opens(sd, idx):
                 chosen = idx
                 log.info("Playing audio on the connected headset [%d]: %s",
@@ -1280,6 +1478,11 @@ class VoiceMCP(MCPBase):
             import sounddevice as sd
             import soundfile as sf
             data, sr = sf.read(path, dtype='float32')
+            if abs(self.tts_gain - 1.0) > 1e-3:
+                import numpy as np
+                # Clip rather than wrap: a large boost should flatten the
+                # loudest peaks, not turn them into crackle.
+                data = np.clip(data * self.tts_gain, -1.0, 1.0)
             out = self._select_output_device(sd)
             sd.play(data, sr, device=out)
             while not self._stop_playback.wait(0.05):
@@ -1350,6 +1553,10 @@ class VoiceMCP(MCPBase):
     def get_listen_error(self) -> str:
         """Why capture is not running, or an empty string if it is."""
         return self._last_listen_error
+
+    def has_live_tts(self) -> bool:
+        """True if at least one TTS backend is available to speak."""
+        return bool([b for b in self._backend_order if b not in self._disabled_backends])
 
     def _get_status_text(self) -> str:
         """Get voice status as text."""
@@ -1433,6 +1640,7 @@ class VoiceMCP(MCPBase):
                 b for b in self._backend_order if b not in self._disabled_backends
             ],
             "tts_backends_disabled": sorted(self._disabled_backends),
+            "tts_voice_down": not self.has_live_tts(),
             "fish_tts_model": self.fish_tts_model,
             "fish_voice_id": self.fish_voice_id,
             "muted": self._muted,
