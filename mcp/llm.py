@@ -132,37 +132,19 @@ class LLMMCP(MCPBase):
 
     def __init__(self):
         super().__init__()
+        # LLM provider: "gemini" (default) or "ollama" for local models.
+        self.provider = os.getenv("LLM_PROVIDER", "gemini").strip().lower()
         self.model = os.getenv("LLM_MODEL", "gemini-flash-latest")
-        # Gemini's OpenAI-compatible endpoint. v1beta is required: the v1
-        # alias returns 404 for the current flash models.
-        self.base_url = os.getenv(
-            "LLM_BASE_URL",
-            "https://generativelanguage.googleapis.com/v1beta/openai/",
-        )
-        # Gemini 3.x reasons before answering, and those thinking tokens come
-        # out of max_tokens. A small budget yields an empty or cut-off reply.
         self.max_tokens = int(os.getenv("LLM_MAX_TOKENS", "800"))
         self.cooldown = 1.5
         self._last_call = 0.0
         # Absolute time before which every call is refused (burst rate limit).
         self._penalty_until = 0.0
-        # Models to try in order, the configured one first.
-        self.fallback_models = tuple(
-            m.strip() for m in os.getenv("LLM_FALLBACK_MODELS", "").split(",") if m.strip()
-        )
-        self.models: List[str] = list(
-            dict.fromkeys([self.model, *(self.fallback_models or DEFAULT_FALLBACK_MODELS)])
-        )
-        # Wall-clock time at which each model frees up again, for the ones whose
-        # daily allowance is spent.
+        # Common state, always initialized regardless of provider.
         self._exhausted_until: Dict[str, float] = {}
-        # Models this key cannot use. Nothing to do with quota, so no retrying.
         self._unusable: set = set()
-        # Requests this process has sent, per model, for the current day.
         self._daily_spend: Dict[str, int] = {}
         self._spend_day: Optional[str] = None
-        self.daily_limit = int(os.getenv("LLM_DAILY_LIMIT", str(FREE_TIER_DAILY_LIMIT)))
-        self.answer_reserve = int(os.getenv("LLM_ANSWER_RESERVE", str(DAILY_ANSWER_RESERVE)))
         self._active_model: Optional[str] = None
         self._last_error: str = ""
         self._last_error_kind: str = ""
@@ -175,6 +157,39 @@ class LLMMCP(MCPBase):
         self._max_history = 10
         self._budget_path = Path(os.getenv("LLM_BUDGET_PATH", str(Path(__file__).resolve().parent.parent / "jarvis_llm_budget.json")))
         self._load_budget()
+
+        # Provider-specific configuration.
+        if self.provider == "ollama":
+            # Ollama's OpenAI-compatible API lives at {base_url}/v1.
+            ollama_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434").rstrip("/")
+            if not ollama_url.endswith("/v1"):
+                ollama_url = ollama_url + "/v1"
+            self.base_url = ollama_url
+            # Ollama does not require an API key; the OpenAI client still
+            # wants a non-empty string, so use a placeholder.
+            self.api_key = "ollama"
+            # Local models have no daily quota or fallback chain.
+            self.fallback_models = ()
+            self.models: List[str] = [self.model]
+            self.daily_limit = 10**9  # effectively unlimited locally
+            self.answer_reserve = 0
+        else:
+            # Gemini's OpenAI-compatible endpoint. v1beta is required: the v1
+            # alias returns 404 for the current flash models.
+            self.base_url = os.getenv(
+                "LLM_BASE_URL",
+                "https://generativelanguage.googleapis.com/v1beta/openai/",
+            )
+            self.api_key = os.environ.get("GOOGLE_API_KEY", "").strip()
+            # Models to try in order, the configured one first.
+            self.fallback_models = tuple(
+                m.strip() for m in os.getenv("LLM_FALLBACK_MODELS", "").split(",") if m.strip()
+            )
+            self.models: List[str] = list(
+                dict.fromkeys([self.model, *(self.fallback_models or DEFAULT_FALLBACK_MODELS)])
+            )
+            self.daily_limit = int(os.getenv("LLM_DAILY_LIMIT", str(FREE_TIER_DAILY_LIMIT)))
+            self.answer_reserve = int(os.getenv("LLM_ANSWER_RESERVE", str(DAILY_ANSWER_RESERVE)))
 
     def _load_budget(self) -> None:
         try:
@@ -210,6 +225,8 @@ class LLMMCP(MCPBase):
     @property
     def available(self) -> bool:
         """True when an API key is configured and the client imports."""
+        if self.provider == "ollama":
+            return self._import_ok()
         return bool(os.environ.get("GOOGLE_API_KEY", "").strip()) and self._import_ok()
 
     def _import_ok(self) -> bool:
@@ -223,14 +240,14 @@ class LLMMCP(MCPBase):
         if self._client is not None:
             return self._client
 
-        api_key = os.environ.get("GOOGLE_API_KEY", "").strip()
-        if not api_key:
-            self._client_error = "GOOGLE_API_KEY is not set"
-            return None
-
         if not self._import_ok():
             self._client_error = "the 'openai' package is not installed"
             log.error("LLM unavailable: %s. Run: pip install openai", self._client_error)
+            return None
+
+        api_key = self.api_key if self.provider == "ollama" else os.environ.get("GOOGLE_API_KEY", "").strip()
+        if self.provider != "ollama" and not api_key:
+            self._client_error = "GOOGLE_API_KEY is not set"
             return None
 
         try:
@@ -244,7 +261,7 @@ class LLMMCP(MCPBase):
             self._client = OpenAI(
                 base_url=self.base_url,
                 api_key=api_key,
-                timeout=20.0,
+                timeout=60.0,
             )
             self._client_error = None
         except Exception as e:
@@ -282,6 +299,9 @@ class LLMMCP(MCPBase):
         return self._daily_spend.get(model, 0)
 
     def _record_spend(self, model: str) -> None:
+        """Record a request against the daily allowance (no-op for Ollama)."""
+        if self.provider == "ollama":
+            return
         self._spend_for(model)
         self._daily_spend[model] = self._daily_spend.get(model, 0) + 1
         self._save_budget()
@@ -295,8 +315,10 @@ class LLMMCP(MCPBase):
         Quota-exhausted models are skipped until their day rolls over; models
         the key cannot use are skipped outright. The local request count is not
         a reason to skip a model, because the provider is the authority on
-        whether anything is left.
+        whether anything is left. Local Ollama models have no quota tracking.
         """
+        if self.provider == "ollama":
+            return list(self.models)
         now = time.time()
         return [
             model
@@ -309,8 +331,10 @@ class LLMMCP(MCPBase):
 
         Routing fires on nearly every utterance, so without this it quietly
         consumes the free tier and leaves nothing for the question the user
-        actually asked.
+        actually asked. Local Ollama models have no quota, so this is a no-op.
         """
+        if self.provider == "ollama":
+            return ""
         if not self._usable_models():
             return self._exhausted_message()
         if self._spend_today() < max(0, self.daily_limit - self.answer_reserve):
@@ -695,9 +719,10 @@ class LLMMCP(MCPBase):
         core was fine while every call failed.
         """
         now = time.time()
-        return {
+        status = {
             "name": self.name,
             "initialized": self._initialized,
+            "provider": self.provider,
             "model": self.model,
             "active_model": self._active_model,
             "models": list(self.models),
@@ -708,8 +733,6 @@ class LLMMCP(MCPBase):
                 model for model, until in self._exhausted_until.items() if until > now
             ),
             "unusable_models": sorted(self._unusable),
-            "daily_requests_used": self._spend_today(),
-            "daily_limit": self.daily_limit,
             # The raw error is a long JSON dump. This endpoint is polled, so it
             # carries the classified cause plus enough of the payload to identify
             # the failure without the whole thing.
@@ -717,3 +740,7 @@ class LLMMCP(MCPBase):
             "last_error": self._last_error[:200] or None,
             "history_length": len(self._conversation_history),
         }
+        if self.provider != "ollama":
+            status["daily_requests_used"] = self._spend_today()
+            status["daily_limit"] = self.daily_limit
+        return status

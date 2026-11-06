@@ -15,6 +15,11 @@ from pathlib import Path
 
 import pytest
 
+# Ensure tests use Gemini by default, even if the user's .env configures Ollama.
+# python-dotenv does not override existing environment variables, so this
+# default survives the ``load_dotenv`` call inside ``jarvis.py``.
+os.environ.setdefault("LLM_PROVIDER", "gemini")
+
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
@@ -68,8 +73,9 @@ def reset_app_timers(request):
 def clean_env(monkeypatch):
     """Remove API keys so offline code paths are exercised."""
     for key in ("OPENROUTER_API_KEY", "FISH_API_KEY", "STREAMELEMENTS_API_KEY",
-                "GOOGLE_API_KEY", "TTS_BACKEND"):
+                "GOOGLE_API_KEY", "TTS_BACKEND", "LLM_PROVIDER"):
         monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("LLM_PROVIDER", "gemini")
     return os.environ
 
 

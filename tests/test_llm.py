@@ -91,6 +91,7 @@ class _FakeCompletions:
 @pytest.fixture
 def llm(monkeypatch):
     monkeypatch.setenv("GOOGLE_API_KEY", "test-key-not-real")
+    monkeypatch.setenv("LLM_PROVIDER", "gemini")
     m = LLMMCP()
     m.initialize()
     m._client = types.SimpleNamespace(
