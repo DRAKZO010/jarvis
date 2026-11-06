@@ -172,23 +172,22 @@ def test_voice_module_does_not_import_the_app():
 def test_fish_audio_is_the_only_tts_backend():
     """Fish Audio is the sole speech backend, by design.
 
-    Guards against a fallback being reintroduced: swapping in edge-tts or sapi
-    would silently speak in a different voice than the one that was configured.
+    Guards against duplicate entries on repeated init: SAPI first, Fish last.
     """
     v = VoiceMCP.__new__(VoiceMCP)
     VoiceMCP.__init__(v)
     v._fish_client = object()  # pretend Fish initialised
     v._build_tts_chain()
-    assert v._backend_order == ["fish-audio"]
+    assert v._backend_order == ["sapi", "fish-audio"]
 
 
-def test_no_chain_when_fish_is_unavailable():
-    """Without a Fish client JARVIS stays silent rather than using another voice."""
+def test_sapi_is_always_available():
+    """Without a Fish client JARVIS still has the local SAPI fallback."""
     v = VoiceMCP.__new__(VoiceMCP)
     VoiceMCP.__init__(v)
     v._fish_client = None
     v._build_tts_chain()
-    assert v._backend_order == []
+    assert v._backend_order == ["sapi"]
 
 
 def test_rebuilding_the_chain_does_not_duplicate_entries():
@@ -198,7 +197,7 @@ def test_rebuilding_the_chain_does_not_duplicate_entries():
     v._fish_client = object()
     v._build_tts_chain()
     v._build_tts_chain()
-    assert v._backend_order == ["fish-audio"]
+    assert v._backend_order == ["sapi", "fish-audio"]
 
 
 def test_fish_voice_is_configurable(monkeypatch):

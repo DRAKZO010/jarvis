@@ -79,8 +79,8 @@ VAD_THRESHOLD = 0.015
 # The derived gate is not capped. Holding it down to a ceiling in a loud room
 # would put it under the noise and break it; it rises instead, and
 # VAD_WARN_THRESHOLD reports that as a warning.
-VAD_NOISE_MULTIPLE = 1.5
-VAD_MIN_THRESHOLD = 0.001
+VAD_NOISE_MULTIPLE = 2.5
+VAD_MIN_THRESHOLD = 0.0001
 # This only decides when to warn. Past this point a quiet voice is unlikely to
 # be detected, and the user deserves to be told rather than left debugging it.
 VAD_WARN_THRESHOLD = 0.01
@@ -111,10 +111,11 @@ VAD_SPEAKING_MULTIPLE = 2.0
 # Audio handed to the recognizer is lifted toward this level. The gate can sit
 # low enough to admit a voice that is still far too quiet to recognise, and
 # Vosk returns an empty transcript for audio at that level.
-VAD_AGC_TARGET = 0.12
-VAD_AGC_MAX_GAIN = 25.0
+VAD_AGC_TARGET = 0.15
+VAD_AGC_MAX_GAIN = 40.0
 # Weight kept on the previous gain, so the level does not jump between blocks.
-VAD_AGC_SMOOTHING = 0.7
+# Lower = faster adaptation to a suddenly quiet or loud voice.
+VAD_AGC_SMOOTHING = 0.5
 
 # Microphone selection. A machine with headsets, speakers and virtual audio
 # inputs often has a Windows default input that carries no signal at all, so
@@ -167,8 +168,8 @@ class UtteranceSegmenter:
         sample_rate: int = 16000,
         block: int = VAD_BLOCK,
         threshold: float = VAD_THRESHOLD,
-        silence_ms: int = 1200,
-        min_speech_ms: int = 300,
+        silence_ms: int = 800,
+        min_speech_ms: int = 200,
         max_utterance_s: float = 12.0,
         pre_roll_ms: int = 500,
         tail_ms: int = 300,
@@ -420,8 +421,9 @@ class VoiceMCP(MCPBase):
         self.block_ms = 40
         self.channels = 1
         # Comma-separated, so the assistant can answer to more than one name.
-        # "jarvis" stays in the list so a rename never locks the user out.
-        self.wake_word = os.getenv("JARVIS_WAKE_WORD", "jarvis")
+        # Leave it blank for always-on listening: every utterance is treated
+        # as a command with no wake word required.
+        self.wake_word = os.getenv("JARVIS_WAKE_WORD", "")
         self.min_command_len = 3
         self.voice_cmd_silence = 1.5
         self.tts_cooldown = 1.5
@@ -471,6 +473,7 @@ class VoiceMCP(MCPBase):
         self._recent_levels: deque = deque(maxlen=600)
         self._blocks_above_gate = 0
         self._utterances_formed = 0
+        self._utterances_formed_at = 0.0
         self._input_gain = 1.0
         # Software amplification for replies. Fish Audio's own level is healthy,
         # but a quiet Windows endpoint (or quiet earbuds) is common enough that
@@ -479,7 +482,7 @@ class VoiceMCP(MCPBase):
         # Where replies play. None means "the system default output".
         self._output_device_cache: Optional[int] = None
         self._output_device_cached_at: float = 0.0
-        self.silence_timeout = 1.2
+        self.silence_timeout = 0.8
         self.max_utterance_s = 12.0
         self._listener_stop = threading.Event()
         self._listener_thread: Optional[threading.Thread] = None
@@ -537,7 +540,10 @@ class VoiceMCP(MCPBase):
                 SetLogLevel(-1)
                 self._vosk_model = Model(str(_model_path_to_load(model_path)))
                 log.info("Vosk model loaded.")
-            except Exception as e:
+            except BaseException as e:
+                # KeyboardInterrupt is a BaseException, not Exception: a Ctrl+C
+                # during model load must not crash with a broken __del__.
+                self._vosk_model = None
                 log.warning("Vosk load failed: %s", e)
 
         # Initialize Fish Audio
@@ -569,17 +575,18 @@ class VoiceMCP(MCPBase):
     def _build_tts_chain(self) -> None:
         """Pick the speech backends to use, in order.
 
-        Fish Audio is the only backend. If it is unavailable or out of credit,
-        JARVIS stays silent rather than quietly speaking in a different voice
-        than the one that was configured.
+        Windows SAPI is first: local, offline, instant, no API key needed.
+        Fish Audio is second: cloud, higher quality, needs API credit.
+        This way JARVIS always answers immediately, and Fish Audio only
+        handles replies when the user wants premium quality.
         """
-        self._backend_order = []
+        self._backend_order = ["sapi"]
         if self._fish_client:
             self._backend_order.append("fish-audio")
         else:
             log.error(
                 "Fish Audio unavailable (FISH_API_KEY missing or client failed). "
-                "JARVIS will be silent."
+                "JARVIS will use the local SAPI voice."
             )
 
     def shutdown(self) -> None:
@@ -744,11 +751,20 @@ class VoiceMCP(MCPBase):
     def _speak_with_fallback(self, text: str) -> bool:
         """Speak ``text`` using the first backend that works.
 
-        A backend that fails is disabled for the rest of the session, so a
-        dead provider (e.g. an out-of-credits Fish Audio account) costs one
-        failed call rather than one per reply.
+        Short replies (confirmations, single sentences) go through the local
+        SAPI backend first so they are instant and never wait on the network.
+        Longer replies try Fish Audio first for quality, then SAPI as fallback.
         """
-        for backend in list(self._backend_order):
+        # Short text: local SAPI first (instant, no network). Long text:
+        # Fish Audio first (best quality), SAPI as safety net.
+        if len(text) <= 120:
+            preferred = ["sapi", "fish-audio"]
+        else:
+            preferred = ["fish-audio", "sapi"]
+        ordered = [b for b in preferred if b in self._backend_order]
+        ordered += [b for b in self._backend_order if b not in ordered]
+
+        for backend in ordered:
             if backend in self._disabled_backends:
                 continue
             if self._stop_playback.is_set():
@@ -757,8 +773,6 @@ class VoiceMCP(MCPBase):
                 if self._TTS_BACKENDS[backend](self, text):
                     self._active_backend = backend
                     return True
-                # A False return can mean "aborted by barge-in" rather than
-                # "backend is broken". Do not punish a good backend for that.
                 if self._stop_playback.is_set():
                     log.debug("Speech interrupted during '%s' backend.", backend)
                     return False
@@ -769,7 +783,7 @@ class VoiceMCP(MCPBase):
                     return False
                 self._disable_backend(backend, str(e))
 
-        log.error("All TTS backends exhausted. Tried: %s", self._backend_order)
+        log.error("All TTS backends exhausted. Tried: %s", ordered)
         return False
 
     def _disable_backend(self, backend: str, reason: str) -> None:
@@ -1138,10 +1152,12 @@ class VoiceMCP(MCPBase):
                             self._ptt_flush.clear()
                             pending = segmenter.flush()
                             if pending:
-                                self._finish_utterance(
-                                    recognizer, utterance=pending, allow_bare=True
-                                )
-                                recognizer.Reset()
+                                threading.Thread(
+                                    target=self._finish_utterance_async,
+                                    args=(pending, True),
+                                    daemon=True,
+                                ).start()
+                            recognizer.Reset()
 
                         data, _overflow = stream.read(VAD_BLOCK)
                         if not data:
@@ -1165,9 +1181,13 @@ class VoiceMCP(MCPBase):
 
                         level = segmenter.rms(data)
                         self._recent_levels.append(level)
+                        # Adapt gain on every block, not just those above the
+                        # gate. Otherwise a quiet mic can never bootstrap itself:
+                        # nothing clears the threshold, so gain never adapts,
+                        # so nothing ever clears the threshold.
+                        self._adapt_input_gain(level)
                         if level >= segmenter.threshold:
                             self._blocks_above_gate += 1
-                            self._adapt_input_gain(level)
 
                         # The recognizer is deliberately NOT fed here. Vosk runs
                         # its acoustic model on every accepted frame, so feeding
@@ -1178,8 +1198,37 @@ class VoiceMCP(MCPBase):
                         utterance = segmenter.push(data, level)
                         if utterance:
                             self._utterances_formed += 1
-                            self._finish_utterance(recognizer, utterance=utterance)
+                            self._utterances_formed_at = time.monotonic()
+                            # Recognition runs in a background thread so the
+                            # listen loop never stops capturing audio while
+                            # Vosk decodes the previous utterance.
+                            threading.Thread(
+                                target=self._finish_utterance_async,
+                                args=(utterance, False),
+                                daemon=True,
+                            ).start()
                             recognizer.Reset()
+
+                        # Dynamically lower the VAD gate if no utterance has
+                        # been detected for a while. A quiet microphone or a
+                        # suddenly quiet room can leave the gate above the
+                        # user's voice, making JARVIS appear deaf. Gradually
+                        # lowering the gate until speech is detected again
+                        # self-corrects without user intervention.
+                        now = time.monotonic()
+                        if (
+                            now - self._utterances_formed_at > 10.0
+                            and self.vad_threshold > VAD_MIN_THRESHOLD
+                        ):
+                            self.vad_threshold = max(
+                                VAD_MIN_THRESHOLD,
+                                self.vad_threshold * 0.9,
+                            )
+                            self._utterances_formed_at = now
+                            log.info(
+                                "VAD gate lowered to %.5f (no speech detected).",
+                                self.vad_threshold,
+                            )
 
             except Exception as e:
                 # A mic that gets unplugged, or is grabbed by another app, must
@@ -1222,12 +1271,19 @@ class VoiceMCP(MCPBase):
         gain = self._input_gain
         if abs(gain - 1.0) < 1e-3:
             return data
-        samples = array.array("h")
-        samples.frombytes(data[:len(data) - (len(data) % 2)])
-        for i, value in enumerate(samples):
-            scaled = int(value * gain)
-            samples[i] = 32767 if scaled > 32767 else (-32768 if scaled < -32768 else scaled)
-        return samples.tobytes()
+        try:
+            import numpy as np
+            samples = np.frombuffer(data[:len(data) - (len(data) % 2)], dtype=np.int16)
+            scaled = samples * gain
+            clipped = np.clip(scaled, -32768, 32767).astype(np.int16)
+            return clipped.tobytes()
+        except Exception:
+            samples = array.array("h")
+            samples.frombytes(data[:len(data) - (len(data) % 2)])
+            for i, value in enumerate(samples):
+                scaled = int(value * gain)
+                samples[i] = 32767 if scaled > 32767 else (-32768 if scaled < -32768 else scaled)
+            return samples.tobytes()
 
     def _finish_utterance(
         self,
@@ -1298,6 +1354,67 @@ class VoiceMCP(MCPBase):
         else:
             log.warning("Speech recognised but no command hook is installed: %s", command)
 
+    def _finish_utterance_async(self, utterance: bytes, allow_bare: bool = False) -> None:
+        """Same as _finish_utterance but creates its own recognizer so it can
+        run on a background thread without blocking the microphone capture."""
+        if not HAS_VOSK:
+            log.warning("Vosk not available for async decode.")
+            return
+        try:
+            recognizer = KaldiRecognizer(self._vosk_model, float(self.sample_rate))
+            recognizer.SetWords(False)
+        except Exception as e:
+            log.warning("Could not create recognizer for async decode: %s", e)
+            return
+        try:
+            recognizer.AcceptWaveform(self._gain_audio(utterance))
+        except Exception as e:
+            log.warning("Async recognition failed: %s", e)
+            return
+
+        try:
+            raw = recognizer.FinalResult()
+        except Exception as e:
+            log.warning("Async FinalResult failed: %s", e)
+            return
+
+        try:
+            text = str(json.loads(raw).get("text", "")).strip()
+        except (ValueError, AttributeError):
+            text = ""
+        if not text:
+            return
+
+        self._last_transcript = text
+        ptt = allow_bare or self._ptt_active.is_set()
+        addressed, command = strip_wake_word(text, self.wake_word)
+
+        if ptt:
+            addressed = True
+        elif not addressed:
+            log.debug("Ignored (no wake word): %s", text)
+            return
+        elif self._wake_blocked():
+            log.debug("Ignored (wake word cooling down): %s", text)
+            return
+
+        if len(command) < self.min_command_len:
+            log.debug("Ignored (too short): %s", text)
+            return
+
+        log.info("HEARD: %s", command)
+        self._emit({"type": "heard", "text": command})
+
+        # Saying the wake word while JARVIS is talking is a barge-in.
+        if self._is_speaking:
+            self.interrupt()
+            self._wake_blocked_until = time.monotonic() + self.wake_cooldown_s
+
+        if _command_hook is not None:
+            _command_hook(command)
+        else:
+            log.warning("Speech recognised but no command hook is installed: %s", command)
+
     # -- Speech output ------------------------------------------------------
 
     def _fish_audio_speak(self, text: str) -> bool:
@@ -1323,6 +1440,19 @@ class VoiceMCP(MCPBase):
                 os.unlink(tmppath)
             except OSError:
                 pass
+
+    def _sapi_speak(self, text: str) -> bool:
+        """Speak via Windows SAPI (local, offline, no API key needed)."""
+        try:
+            import win32com.client
+            speaker = win32com.client.Dispatch("SAPI.SpVoice")
+            if self.tts_gain and abs(self.tts_gain - 1.0) > 1e-3:
+                speaker.Volume = int(100 * self.tts_gain)
+            speaker.Speak(text)
+            return True
+        except Exception as e:
+            log.error("SAPI TTS error: %s", e)
+            return False
 
     # -- Audio output ------------------------------------------------------
 
@@ -1652,4 +1782,5 @@ class VoiceMCP(MCPBase):
 # entry by design; see _build_tts_chain.
 VoiceMCP._TTS_BACKENDS = {
     "fish-audio": VoiceMCP._fish_audio_speak,
+    "sapi": VoiceMCP._sapi_speak,
 }

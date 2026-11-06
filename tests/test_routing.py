@@ -145,7 +145,11 @@ CASES = [
     ("reboot", "restart_pc", None),
     ("hibernate", "hibernate_pc", None),
     ("cancel shutdown", "cancel_shutdown", None),
-    ("sleep", "sleep_pc", None),
+    ("sleep", "jarvis_sleep", None),
+    ("go to sleep", "jarvis_sleep", None),
+    ("put computer to sleep", "sleep_pc", None),
+    ("system sleep", "sleep_pc", None),
+    ("pc sleep", "sleep_pc", None),
 
     # --- voice controls ---
     ("voice status", "voice_status", None),

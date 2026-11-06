@@ -9,6 +9,7 @@ import sys
 import re
 import time
 import asyncio
+import concurrent.futures
 import logging
 import threading
 import webbrowser
@@ -170,6 +171,15 @@ _loop_ref: asyncio.AbstractEventLoop = None
 _shutdown = threading.Event()
 _last_error: Optional[str] = None
 _last_user_cmd = ""
+_jarvis_sleeping = False
+_sleep_events: list[str] = []
+
+# Background executor for LLM command routing. Used to attempt synchronous
+# routing with a short timeout; slow responses fall through to async dispatch
+# so the user is never blocked waiting on the network.
+_routing_executor = concurrent.futures.ThreadPoolExecutor(
+    max_workers=4, thread_name_prefix="jarvis-route"
+)
 
 # The HUD's side panels are hidden until they are asked for, so the screen
 # shows the neural core and nothing else. The state lives on the server so a
@@ -348,7 +358,7 @@ def _speak_stream_broadcast(generator_func, *args) -> None:
 # pending instead. A report answers in milliseconds and the answer is the useful
 # part, so announcing first would bury it; opening an app takes seconds and
 # needs the acknowledgement straight away.
-ACTION_ANSWER_GRACE_S = 0.6
+ACTION_ANSWER_GRACE_S = 0.3
 
 # Reports can be long - thirty window titles, twenty processes. Reading all of it
 # aloud is worse than useless, so the spoken result is capped. The HUD receives
@@ -449,6 +459,14 @@ def _record_error(exc: BaseException, context: str = "") -> None:
     global _last_error
     _last_error = f"{type(exc).__name__}: {exc}" + (f" (in {context})" if context else "")
     log.debug("Recorded error: %s", _last_error)
+
+
+def _record_sleep_event(text: str) -> None:
+    """Log something that happened while Jarvis was in standby, for the wake-up brief."""
+    global _sleep_events
+    if len(_sleep_events) >= 50:
+        _sleep_events.pop(0)
+    _sleep_events.append(text)
 
 
 def _try_self_heal(error_msg: str, context: str = "") -> bool:
@@ -722,6 +740,48 @@ FUZZY_COMMANDS = {
     "ongs": "song",
     "tune": "tune",
     "tunes": "tunes",
+    
+    # System / power
+    "sleap": "sleep",
+    "slepp": "sleep",
+    "slepe": "sleep",
+    "wak": "wake",
+    "wakeup": "wake up",
+    "shudown": "shutdown",
+    "shudn": "shutdown",
+    "reboot": "restart",
+    "re boot": "restart",
+    "hibrnat": "hibernate",
+    
+    # Reminders / tasks
+    "remind": "reminder",
+    "reminder": "reminder",
+    "reminde": "reminder",
+    "alarm": "alarm",
+    "alar": "alarm",
+    "timer": "timer",
+    "timr": "timer",
+    "task": "task",
+    "tas": "task",
+    "todo": "task",
+    
+    # Navigation / apps
+    "notepad": "notepad",
+    "calc": "calculator",
+    "calculater": "calculator",
+    "browser": "browser",
+    "chrome": "chrome",
+    "edge": "edge",
+    
+    # Common mishearings
+    "please": "please",
+    "pls": "please",
+    "plz": "please",
+    "sir": "sir",
+    "ser": "sir",
+    "jarvis": "jarvis",
+    "jarvus": "jarvis",
+    "jarvis": "jarvis",
 }
 
 
@@ -988,6 +1048,9 @@ _ACTION_PATTERNS = [
     (r"^(?:can\s+you\s+)?(?:please\s+)?remember\s+(.+)$", "remember"),
     (r"^(?:can\s+you\s+)?(?:please\s+)?recall\s+(.+)$", "recall"),
     (r"^what\s+(?:do\s+)?(?:i|you)\s+(?:know|have)\s+(?:about|of|on)\s+(.+)$", "recall"),
+    # Standby / brief
+    (r"^(?:can\s+you\s+)?(?:please\s+)?brief\s+(?:me)?(?:\s+on\s+(.+))?$", "brief"),
+    (r"^what\s+(?:happened|went\s+on)(?:\s+while\s+(?:i\s+was\s+)?(?:away|gone|asleep))?$", "brief"),
     # Tasks - flexible
     (r"^(?:can\s+you\s+)?(?:please\s+)?add\s+task\s*[:\-]?\s*(.+)$", "add_task"),
     (r"^(?:can\s+you\s+)?(?:please\s+)?(?:add|create)\s+(?:a\s+)?task\s+(.+)$", "add_task"),
@@ -1069,8 +1132,14 @@ _ACTION_PATTERNS = [
     (r"^(?:can\s+you\s+)?(?:please\s+)?cancel\s+(?:the\s+)?shutdown$", "cancel_shutdown"),
     (r"^(?:can\s+you\s+)?(?:please\s+)?lock\s+(?:the\s+)?(?:pc|computer|laptop|screen)$", "lock_pc"),
     (r"^(?:can\s+you\s+)?(?:please\s+)?(?:log\s*off|sign\s*out)\s*(?:the\s+)?(?:pc|computer)?$", "lock_pc"),
-    (r"^(?:can\s+you\s+)?(?:please\s+)?sleep$", "sleep_pc"),
-    (r"^(?:can\s+you\s+)?(?:please\s+)?(?:go\s+to\s+)?sleep(?:\s+(?:pc|computer|laptop))?$", "sleep_pc"),
+    # Assistant sleep mode: the PC stays on, Jarvis just stands down.
+    (r"^(?:can\s+you\s+)?(?:please\s+)?sleep$", "jarvis_sleep"),
+    (r"^(?:can\s+you\s+)?(?:please\s+)?(?:go\s+to\s+)?sleep(?:\s+(?:pc|computer|laptop))?$", "jarvis_sleep"),
+    (r"^(?:can\s+you\s+)?(?:please\s+)?wake\s+(?:up)?(?:\s+(?:jarvis|assistant))?$", "jarvis_wake"),
+    # Actual system sleep - explicit target required.
+    (r"^(?:can\s+you\s+)?(?:please\s+)?(?:put\s+)?(?:the\s+)?(?:pc|computer|laptop|system)\s+to\s+sleep$", "sleep_pc"),
+    (r"^(?:can\s+you\s+)?(?:please\s+)?system\s+sleep$", "sleep_pc"),
+    (r"^(?:can\s+you\s+)?(?:please\s+)?pc\s+sleep$", "sleep_pc"),
     (r"^(?:can\s+you\s+)?(?:please\s+)?hibernate$", "hibernate_pc"),
     # Mouse/Keyboard
     (r"^(?:can\s+you\s+)?(?:please\s+)?click\s+(?:at\s+)?(\d+)\s*,?\s*(\d+)$", "mouse_click"),
@@ -1302,7 +1371,7 @@ def _match_pattern(lower: str) -> Optional[tuple[str, str, str]]:
     return None
 
 
-def _detect_action(cmd: str) -> Optional[tuple[str, str]]:
+def _detect_action(cmd: str, memory: Optional[dict] = None) -> Optional[tuple[str, str]]:
     lower = cmd.strip().lower()
     if not lower:
         return None
@@ -1325,26 +1394,71 @@ def _detect_action(cmd: str) -> Optional[tuple[str, str]]:
         log.info("Fuzzy match '%s' -> '%s' rejected as untrustworthy", lower, corrected)
 
     # 3. Ask the LLM to map free-form language onto an action.
+    #    Run in the background so the user gets an immediate conversational
+    #    response instead of waiting on a network round-trip. If the background
+    #    routing resolves to a real action, it is executed asynchronously.
     #    A question is not a candidate for an action, and the Gemini free tier
-    #    only allows 20 requests a day, so spending one to be told "chat" and
-    #    then another to answer it doubles the cost of every question. Anything
-    #    that reads as a question goes straight to the conversational path.
+    #    only allows 20 requests a day, so anything that reads as a question
+    #    goes straight to the conversational path.
     if _looks_like_question(lower):
         log.debug("'%s' reads as a question, skipping the routing request", lower)
         return ("chat", cmd)
 
-    result = _llm_parse_command(lower)
-    if result:
-        return result
+    if memory is None:
+        memory = {}
 
-    # 4. Nothing matched - treat it as conversation.
+    # Try synchronous routing first with a short timeout. Fast responses
+    # (e.g. test fakes) return immediately; slow network calls fall through
+    # to async dispatch so the user is never blocked.
+    try:
+        future = _routing_executor.submit(_llm_parse_command, lower)
+        result = future.result(timeout=0.3)
+        if result is not None and result[0] != "chat":
+            return result
+    except concurrent.futures.TimeoutError:
+        pass  # Slow LLM - fall through to async
+    except Exception as e:
+        log.debug("Synchronous LLM routing failed: %s", e)
+
+    # Fall back to async routing so the user gets an immediate reply.
+    threading.Thread(
+        target=_llm_route_background, args=(lower, cmd, memory), daemon=True,
+    ).start()
+
+    # 4. Nothing matched yet - treat it as conversation so the user hears an
+    #    immediate reply while LLM routing resolves in the background.
     return ("chat", cmd)
+
+
+def _llm_route_background(lower: str, cmd: str, memory: dict) -> None:
+    """Run LLM command routing in a background thread.
+
+    If the LLM resolves the utterance to a real action (not ``chat``),
+    execute it via ``_handle_command_inner`` with the pre-detected action,
+    bypassing the detection phase so we don't loop back into routing.
+    """
+    try:
+        result = _llm_parse_command(lower)
+    except Exception as e:
+        log.error("Background LLM routing error: %s", e)
+        return
+    if result is None:
+        return
+    action_type, payload = result
+    if action_type == "chat":
+        return
+    log.info("Background LLM routed '%s' -> %s", lower, action_type)
+    try:
+        _handle_command_inner(cmd, memory, pre_action=(action_type, payload))
+    except Exception as e:
+        log.error("Background action execution error: %s", e)
+
 
 # ---------------------------------------------------------------------------
 # Command handler - speak DURING action
 # ---------------------------------------------------------------------------
 
-def _reset_status_delayed(delay: float = 8.0) -> None:
+def _reset_status_delayed(delay: float = 2.0) -> None:
     """Reset status to listening after a delay (safety net for stuck states)."""
     def _do_reset():
         time.sleep(delay)
@@ -1399,85 +1513,119 @@ def handle_command(text: str, memory: dict) -> None:
         _reset_status_delayed()
 
 
-def _handle_command_inner(cmd: str, memory: dict) -> None:
+def _handle_command_inner(cmd: str, memory: dict, pre_action: Optional[tuple[str, str]] = None) -> None:
     """Inner command handler - exceptions propagate to caller for logging."""
-    action = _detect_action(cmd)
-    if action:
+    global _jarvis_sleeping
+    if pre_action is not None:
+        action_type, payload = pre_action
+    else:
+        action = _detect_action(cmd)
+        if not action:
+            return
         action_type, payload = action
 
-        verdict = loop_guard.check_call(action_type, payload)
-        if verdict.blocked:
-            log.warning("Command blocked by LoopGuard: %s (%s)", action_type, verdict.reason)
-            speak(f"I have paused that operation, sir: {verdict.reason}")
-            return
+    if _jarvis_sleeping and action_type != "jarvis_wake":
+        _record_sleep_event(cmd)
+        speak("I'm in standby, sir. Say 'wake up' to bring me back.")
+        return
 
-        # Quick responses - speak immediately
-        if action_type == "cancel":
-            voice_mcp.interrupt()
-            speak("Understood. Command cancelled, sir.")
-            return
-        elif action_type == "show_panels":
-            set_panels(True)
-            speak("Panels displayed, sir.")
-            return
-        elif action_type == "hide_panels":
-            set_panels(False)
-            speak("Panels hidden, sir.")
-            return
-        elif action_type == "time":
-            n = datetime.now()
-            speak(f"It is currently {n.strftime('%I:%M %p')} on {n.strftime('%A, %B %d, %Y')}.")
-            return
-        elif action_type == "greeting":
-            speak(random.choice([
-                "Good to see you, sir.",
-                "At your service, sir.",
-                "How may I assist you today?",
-                "Hello, sir. What can I do for you?",
-                "Greetings, sir. Ready when you are.",
-                "Ah, sir. Always a pleasure to hear from you.",
-            ]))
-            return
-        elif action_type == "thanks":
-            speak(random.choice([
-                "You're welcome, sir.",
-                "My pleasure.",
-                "Happy to help.",
-                "Always at your service.",
-                "Anytime, sir. That's what I'm here for.",
-                "Glad I could assist, sir.",
-            ]))
-            return
-        elif action_type == "about":
-            speak(f"I am {APP_NAME}, your personal AI assistant. Created to make your life easier, sir.")
-            return
-        elif action_type == "chat":
-            # Stream LLM response to speech + UI for zero-latency feel
-            def _chat_stream():
-                try:
-                    chat_input = payload if payload else cmd
+    verdict = loop_guard.check_call(action_type, payload)
+    if verdict.blocked:
+        log.warning("Command blocked by LoopGuard: %s (%s)", action_type, verdict.reason)
+        speak(f"I have paused that operation, sir: {verdict.reason}")
+        return
 
-                    time_sensitive = any(kw in chat_input.lower() for kw in [
-                        "happening", "news", "latest", "current", "today", "now",
-                        "world cup", "election", "score", "result", "tournament",
-                        "war", "crisis", "stock", "price", "weather", "forecast"
-                    ])
+    # Quick responses - speak immediately
+    if action_type == "cancel":
+        voice_mcp.interrupt()
+        speak("Understood. Command cancelled, sir.")
+        return
+    elif action_type == "show_panels":
+        set_panels(True)
+        speak("Panels displayed, sir.")
+        return
+    elif action_type == "hide_panels":
+        set_panels(False)
+        speak("Panels hidden, sir.")
+        return
+    elif action_type == "time":
+        n = datetime.now()
+        speak(f"It is currently {n.strftime('%I:%M %p')} on {n.strftime('%A, %B %d, %Y')}.")
+        return
+    elif action_type == "greeting":
+        speak(random.choice([
+            "Good to see you, sir.",
+            "At your service, sir.",
+            "How may I assist you today?",
+            "Hello, sir. What can I do for you?",
+            "Greetings, sir. Ready when you are.",
+            "Ah, sir. Always a pleasure to hear from you.",
+        ]))
+        return
+    elif action_type == "jarvis_sleep":
+        _jarvis_sleeping = True
+        _sleep_events.clear()
+        speak("Going into standby, sir. The system stays on - I'll keep running pending jobs and brief you when you wake me.")
+        return
+    elif action_type == "jarvis_wake":
+        if not _jarvis_sleeping:
+            speak("I'm already awake, sir.")
+            return
+        _jarvis_sleeping = False
+        speak("Standby ended, sir. I'm back.")
+        if _sleep_events:
+            speak("Here's what happened while you were away: " + "; ".join(_sleep_events))
+            _sleep_events.clear()
+        else:
+            speak("Nothing to report while you were away, sir.")
+        return
+    elif action_type == "brief":
+        if _sleep_events:
+            speak("Here's what happened while you were away: " + "; ".join(_sleep_events))
+            _sleep_events.clear()
+        else:
+            speak("Nothing to report, sir.")
+        return
+    elif action_type == "thanks":
+        speak(random.choice([
+            "You're welcome, sir.",
+            "My pleasure.",
+            "Happy to help.",
+            "Always at your service.",
+            "Anytime, sir. That's what I'm here for.",
+            "Glad I could assist, sir.",
+        ]))
+        return
+    elif action_type == "about":
+        speak(f"I am {APP_NAME}, your personal AI assistant. Created to make your life easier, sir.")
+        return
+    elif action_type == "chat":
+        # Stream LLM response to speech + UI for zero-latency feel
+        def _chat_stream():
+            try:
+                chat_input = payload if payload else cmd
 
-                    context_info = ""
-                    if time_sensitive:
-                        try:
-                            if any(kw in chat_input.lower() for kw in ["world cup", "football", "soccer", "cricket", "tennis", "nba", "score", "tournament"]):
-                                news = news_mcp.get_news_by_topic(chat_input)
-                            else:
-                                news = news_mcp.get_news()
-                            if news and "unable" not in news.lower() and "slow" not in news.lower():
-                                cleaned_news = _clean_news(news)
-                                if cleaned_news:
-                                    context_info = f"\n\nHere's what's happening right now:\n{cleaned_news}"
-                        except Exception:
-                            pass
+                time_sensitive = any(kw in chat_input.lower() for kw in [
+                    "happening", "news", "latest", "current", "today", "now",
+                    "world cup", "election", "score", "result", "tournament",
+                    "war", "crisis", "stock", "price", "weather", "forecast"
+                ])
 
-                    chat_prompt = f"""{llm_mcp._load_soul()}
+                context_info = ""
+                if time_sensitive:
+                    try:
+                        if any(kw in chat_input.lower() for kw in ["world cup", "football", "soccer", "cricket", "tennis", "nba", "score", "tournament"]):
+                            news = news_mcp.get_news_by_topic(chat_input)
+                        else:
+                            news = news_mcp.get_news()
+                        if news and "unable" not in news.lower() and "slow" not in news.lower():
+                            cleaned_news = _clean_news(news)
+                            if cleaned_news:
+                                context_info = f"\n\nHere's what's happening right now:\n{cleaned_news}"
+                    except Exception:
+                        pass
+
+                chat_prompt = f"""{llm_mcp._load_soul()}
 
 Here is what is currently happening with this topic:
 {context_info}
@@ -1487,454 +1635,451 @@ Respond naturally like a friend telling you what they just heard. 1-2 sentences 
 User: {chat_input}
 
 JARVIS:"""
-                    _speak_stream_broadcast(_ask_llm_stream, chat_prompt, {})
-                except Exception as e:
-                    log.error("Chat stream error: %s", e)
-                    speak("I'm not sure how to respond to that, sir.")
-            threading.Thread(target=_chat_stream, daemon=True).start()
-            return
-        elif action_type == "sleep":
-            speak("Going to sleep mode, sir. Good night.")
-            return
+                _speak_stream_broadcast(_ask_llm_stream, chat_prompt, {})
+            except Exception as e:
+                log.error("Chat stream error: %s", e)
+                speak("I'm not sure how to respond to that, sir.")
+        threading.Thread(target=_chat_stream, daemon=True).start()
+        return
+    elif action_type == "sleep":
+        speak("Going to sleep mode, sir. Good night.")
+        return
 
-        # Actions - speak FIRST, action runs in background
-        elif action_type == "focus_jarvis":
-            # Switch focus to the HUD tab in Chrome
-            def _focus_jarvis():
-                import win32gui
-                import win32con
-                # Find the Chrome window showing the HUD. Match the title
-                # (index.html <title>) as well as the dev-server hostnames,
-                # since the title follows APP_NAME.
-                def enum_callback(hwnd, results):
+    # Actions - speak FIRST, action runs in background
+    elif action_type == "focus_jarvis":
+        # Switch focus to the HUD tab in Chrome
+        def _focus_jarvis():
+            import win32gui
+            import win32con
+            # Find the Chrome window showing the HUD. Match the title
+            # (index.html <title>) as well as the dev-server hostnames,
+            # since the title follows APP_NAME.
+            def enum_callback(hwnd, results):
+                if win32gui.IsWindowVisible(hwnd):
+                    title = win32gui.GetWindowText(hwnd).lower()
+                    if is_hud_window_title(title):
+                        results.append(hwnd)
+            windows = []
+            win32gui.EnumWindows(enum_callback, windows)
+            if windows:
+                hwnd = windows[0]
+                if win32gui.IsIconic(hwnd):
+                    win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+                win32gui.SetForegroundWindow(hwnd)
+                log.info("Focused %s window", APP_NAME)
+            else:
+                log.info("%s window not found, trying any Chrome window", APP_NAME)
+                # Fallback: focus any Chrome window
+                def enum_chrome(hwnd, results):
                     if win32gui.IsWindowVisible(hwnd):
                         title = win32gui.GetWindowText(hwnd).lower()
-                        if is_hud_window_title(title):
+                        if 'chrome' in title:
                             results.append(hwnd)
-                windows = []
-                win32gui.EnumWindows(enum_callback, windows)
-                if windows:
-                    hwnd = windows[0]
+                chrome_windows = []
+                win32gui.EnumWindows(enum_chrome, chrome_windows)
+                if chrome_windows:
+                    hwnd = chrome_windows[0]
                     if win32gui.IsIconic(hwnd):
                         win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
                     win32gui.SetForegroundWindow(hwnd)
-                    log.info("Focused %s window", APP_NAME)
-                else:
-                    log.info("%s window not found, trying any Chrome window", APP_NAME)
-                    # Fallback: focus any Chrome window
-                    def enum_chrome(hwnd, results):
-                        if win32gui.IsWindowVisible(hwnd):
-                            title = win32gui.GetWindowText(hwnd).lower()
-                            if 'chrome' in title:
-                                results.append(hwnd)
-                    chrome_windows = []
-                    win32gui.EnumWindows(enum_chrome, chrome_windows)
-                    if chrome_windows:
-                        hwnd = chrome_windows[0]
-                        if win32gui.IsIconic(hwnd):
-                            win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
-                        win32gui.SetForegroundWindow(hwnd)
-                        log.info("Focused Chrome window")
-            threading.Thread(target=_focus_jarvis, daemon=True).start()
-            speak("Back to JARVIS, sir.")
-            return
-        elif action_type == "open_app":
-            target = clean_app_name(payload) or payload
-            _speak_during_act(automation_mcp.open_app, f"Opening {target}...", payload)
-            return
-        elif action_type == "open_website":
-            _speak_during_act(browser_mcp.open, f"Opening {payload}...", payload)
-            return
-        elif action_type == "search":
-            _speak_during_act(browser_mcp.search, f"Searching for {payload}...", payload)
-            return
-        elif action_type == "youtube":
-            _speak_during_act(browser_mcp.open_youtube, f"Opening YouTube for {payload}...", payload)
-            return
-        elif action_type == "spotify":
-            if payload:
-                _speak_during_act(browser_mcp.play_spotify, f"Playing {payload} on Spotify...", payload)
-            else:
-                # Try to resume if Spotify is open, otherwise open it
-                _speak_during_act(browser_mcp.play_spotify, "Opening Spotify...")
-            return
-        elif action_type == "spotify_random":
-            # Play random music based on time of day
-            _speak_during_act(browser_mcp.play_random_music, "Playing some music for you...")
-            return
-        elif action_type == "spotify_play":
-            _speak_during_act(browser_mcp.spotify_control, "Playing...", "play")
-            return
-        elif action_type == "spotify_pause":
-            _speak_during_act(browser_mcp.spotify_control, "Pausing...", "pause")
-            return
-        elif action_type == "spotify_next":
-            _speak_during_act(browser_mcp.spotify_control, "Next track...", "next")
-            return
-        elif action_type == "spotify_previous":
-            _speak_during_act(browser_mcp.spotify_control, "Previous track...", "previous")
-            return
-        elif action_type == "spotify_volume_up":
-            _speak_during_act(browser_mcp.spotify_control, "Volume up...", "volume_up")
-            return
-        elif action_type == "spotify_volume_down":
-            _speak_during_act(browser_mcp.spotify_control, "Volume down...", "volume_down")
-            return
-        elif action_type == "spotify_volume_set":
-            # Extract percentage from payload
-            try:
-                val = int(re.search(r'(\d{1,3})', payload).group(1))
-                _speak_during_act(browser_mcp.spotify_control, f"Setting volume to {val} percent...", "volume_set", val)
-            except (ValueError, AttributeError):
-                speak("What volume level would you like, sir?")
-            return
-        elif action_type == "spotify_volume_max":
-            _speak_during_act(browser_mcp.spotify_control, "Volume to maximum...", "volume_max")
-            return
-        elif action_type == "spotify_volume_min":
-            _speak_during_act(browser_mcp.spotify_control, "Volume to minimum...", "volume_min")
-            return
-        elif action_type == "spotify_mute":
-            _speak_during_act(browser_mcp.spotify_control, "Muting...", "mute")
-            return
-        elif action_type == "spotify_shuffle":
-            _speak_during_act(browser_mcp.spotify_control, "Toggling shuffle...", "shuffle")
-            return
-        elif action_type == "spotify_repeat":
-            _speak_during_act(browser_mcp.spotify_control, "Toggling repeat...", "repeat")
-            return
-        elif action_type == "gmail":
-            _speak_during_act(browser_mcp.open_gmail, "Opening Gmail...")
-            return
-        elif action_type == "maps":
-            _speak_during_act(browser_mcp.open_maps, "Opening Maps...")
-            return
-        elif action_type == "brightness":
-            _speak_during_act(automation_mcp.set_brightness, f"Setting brightness to {payload} percent.", int(payload))
-            return
-        elif action_type == "volume":
-            # The pattern only captures a number, so max/min arrive with an
-            # empty payload. Normalise before the int() conversion.
-            level = (payload or "").strip()
-            if not level:
-                level = "100" if re.search(r"\b(max|maximum|full|loudest)\b", cmd) else "0"
-            try:
-                value = max(0, min(100, int(level)))
-            except ValueError:
-                speak("What volume level would you like, sir?", )
-                return
-            _speak_during_act(automation_mcp.set_volume, f"Setting volume to {value} percent.", value)
-            return
-        elif action_type == "volume_mute":
-            _speak_during_act(automation_mcp.set_volume, "Muting system volume.", 0)
-            return
-        elif action_type == "volume_unmute":
-            _speak_during_act(automation_mcp.set_volume, "Restoring system volume.", 50)
-            return
-        elif action_type == "execute":
-            _speak_during_act(automation_mcp.execute_command, f"Executing {payload}...", payload)
-            return
-        elif action_type == "remember":
-            _speak_during_act(memory_mcp.remember, f"Remembering: {payload}", payload)
-            return
-        elif action_type == "recall":
-            _speak_during_act(memory_mcp.recall, f"Recalling: {payload}", payload)
-            return
-        elif action_type == "add_task":
-            _task_action(tasks_mcp.add_task, f"Adding task: {payload}", payload)
-            return
-        elif action_type == "complete_task":
-            _task_action(tasks_mcp.complete_task, f"Marking task {payload} as complete.", int(payload))
-            return
-        elif action_type == "delete_task":
-            _task_action(tasks_mcp.delete_task, f"Deleting task {payload}.", int(payload))
-            return
-        elif action_type == "delete_multiple_tasks":
-            _task_action(tasks_mcp.delete_multiple_tasks, f"Deleting tasks {payload}.", payload)
-            return
-        elif action_type == "clear_all_tasks":
-            _task_action(tasks_mcp.clear_all_tasks, "Clearing all tasks...")
-            return
-        elif action_type == "delete_task_by_desc":
-            _task_action(tasks_mcp.delete_task_by_description, f"Deleting task {payload}...", payload)
-            return
-        elif action_type == "list_tasks":
-            _task_action(tasks_mcp.list_tasks, "Here are your tasks.")
-            return
-        elif action_type == "clear_tasks":
-            _task_action(tasks_mcp.clear_done_tasks, "Clearing completed tasks.")
-            return
-        elif action_type == "system_info":
-            _speak_during_act(system_mcp.get_system_info, "Checking system status...")
-            return
-        elif action_type == "cpu_info":
-            _speak_during_act(system_mcp.handle, "Checking CPU...", "cpu", "")
-            return
-        elif action_type == "ram_info":
-            _speak_during_act(system_mcp.handle, "Checking memory...", "ram", "")
-            return
-        elif action_type == "battery_info":
-            _speak_during_act(system_mcp.handle, "Checking battery...", "battery", "")
-            return
-        elif action_type == "disk_info":
-            _speak_during_act(system_mcp.handle, "Checking disk...", "disk", "")
-            return
-        elif action_type == "network_info":
-            _speak_during_act(system_mcp.handle, "Checking network...", "network", "")
-            return
-        elif action_type == "running_apps":
-            _speak_during_act(system_mcp.get_running_apps, "Checking running apps...")
-            return
-        elif action_type == "find_file":
-            _speak_during_act(files_mcp.find_file, f"Searching for file {payload}...", payload)
-            return
-        elif action_type == "open_file":
-            _speak_during_act(files_mcp.open_file, f"Opening file {payload}...", payload)
-            return
-        elif action_type == "open_folder":
-            _speak_during_act(files_mcp.open_folder, f"Opening folder {payload}...", payload)
-            return
-        elif action_type == "recent_files":
-            _speak_during_act(files_mcp.list_recent_files, "Here are your recent files.")
-            return
-        # File operations
-        elif action_type == "create_file":
-            _speak_during_act(automation_mcp.create_file, f"Creating file {payload}...", payload)
-            return
-        elif action_type == "read_file":
-            _speak_during_act(automation_mcp.read_file, f"Reading file {payload}...", payload)
-            return
-        elif action_type == "delete_file":
-            _speak_during_act(automation_mcp.delete_file, f"Deleting file {payload}...", payload)
-            return
-        elif action_type == "copy_file":
-            parts = payload.split(" to ", 1)
-            if len(parts) == 2:
-                _speak_during_act(automation_mcp.copy_file, f"Copying {parts[0].strip()}...", parts[0].strip(), parts[1].strip())
-            else:
-                speak("Please specify source and destination, sir.")
-            return
-        elif action_type == "move_file":
-            parts = payload.split(" to ", 1)
-            if len(parts) == 2:
-                _speak_during_act(automation_mcp.move_file, f"Moving {parts[0].strip()}...", parts[0].strip(), parts[1].strip())
-            else:
-                speak("Please specify source and destination, sir.")
-            return
-        elif action_type == "list_directory":
-            path = payload if payload else "."
-            _speak_during_act(automation_mcp.list_directory, f"Listing {path}.", path)
-            return
-        # Window management
-        elif action_type == "minimize_window":
-            _speak_during_act(automation_mcp.minimize_window, "Minimizing window...")
-            return
-        elif action_type == "maximize_window":
-            _speak_during_act(automation_mcp.maximize_window, "Maximizing window...")
-            return
-        elif action_type == "close_window":
-            _speak_during_act(automation_mcp.close_window, "Closing window...")
-            return
-        elif action_type == "close_app":
-            target = clean_app_name(payload) or payload
-            _speak_during_act(automation_mcp.close_app, f"Closing {target}...", payload)
-            return
-        elif action_type == "close_tab":
-            def _close_tab():
-                import pyautogui
-                pyautogui.hotkey('ctrl', 'w')
-            threading.Thread(target=_close_tab, daemon=True).start()
-            speak("Closing tab, sir.")
-            return
-        elif action_type == "focus_window":
-            _speak_during_act(automation_mcp.focus_window, f"Focusing {payload}...", payload)
-            return
-        elif action_type == "list_windows":
-            _speak_during_act(automation_mcp.list_windows, "Here are the open windows...")
-            return
-        # Process management
-        elif action_type == "kill_process":
-            _speak_during_act(automation_mcp.kill_process, f"Killing {payload}...", payload)
-            return
-        elif action_type == "list_processes":
-            _speak_during_act(automation_mcp.list_processes, "Here are the running processes...")
-            return
-        # Screenshot
-        elif action_type == "take_screenshot":
-            _speak_during_act(automation_mcp.take_screenshot, "Taking screenshot...")
-            return
-        elif action_type == "delete_screenshots":
-            _speak_during_act(automation_mcp.delete_screenshots, "Deleting screenshots...")
-            return
-        elif action_type == "delete_last_screenshot":
-            _speak_during_act(automation_mcp.delete_last_screenshot, "Deleting last screenshot...")
-            return
-        # Clipboard
-        elif action_type == "get_clipboard":
-            _speak_during_act(automation_mcp.get_clipboard, "Reading clipboard...")
-            return
-        elif action_type == "set_clipboard":
-            _speak_during_act(automation_mcp.set_clipboard, f"Copied to clipboard: {payload}", payload)
-            return
-        # System commands
-        elif action_type == "shutdown_pc":
-            _speak_during_act(automation_mcp.shutdown_pc, "Shutting down...")
-            return
-        elif action_type == "restart_pc":
-            _speak_during_act(automation_mcp.restart_pc, "Restarting...")
-            return
-        elif action_type == "cancel_shutdown":
-            _speak_during_act(automation_mcp.cancel_shutdown, "Cancelling shutdown...")
-            return
-        elif action_type == "lock_pc":
-            _speak_during_act(automation_mcp.lock_pc, "Locking computer...")
-            return
-        elif action_type == "sleep_pc":
-            _speak_during_act(automation_mcp.sleep_pc, "Going to sleep...")
-            return
-        elif action_type == "hibernate_pc":
-            _speak_during_act(automation_mcp.hibernate_pc, "Hibernating...")
-            return
-        # Mouse/Keyboard
-        elif action_type == "mouse_click":
-            try:
-                nums = re.findall(r'\d+', payload)
-                x, y = int(nums[0]), int(nums[1])
-                _speak_during_act(automation_mcp.mouse_click, f"Clicking at {x}, {y}...", x, y)
-            except (ValueError, IndexError):
-                speak("Please specify coordinates like 500, 300, sir.")
-            return
-        elif action_type == "mouse_move":
-            try:
-                nums = re.findall(r'\d+', payload)
-                x, y = int(nums[0]), int(nums[1])
-                _speak_during_act(automation_mcp.mouse_move, f"Moving mouse to {x}, {y}...", x, y)
-            except (ValueError, IndexError):
-                speak("Please specify coordinates like 500, 300, sir.")
-            return
-        elif action_type == "type_text":
-            # Check if payload has "in [app]" format
-            parts = payload.rsplit(" in ", 1)
-            text = parts[0].strip()
-            app = parts[1].strip() if len(parts) > 1 else None
-            
-            def _type_in_app():
-                import time
-                # Open app first if specified
-                if app:
-                    try:
-                        import win32gui
-                        hwnd = win32gui.GetForegroundWindow()
-                        title = win32gui.GetWindowText(hwnd).lower()
-                        if app.lower() not in title:
-                            automation_mcp.open_app(app)
-                            time.sleep(1.5)
-                    except Exception:
+                    log.info("Focused Chrome window")
+        threading.Thread(target=_focus_jarvis, daemon=True).start()
+        speak("Back to JARVIS, sir.")
+        return
+    elif action_type == "open_app":
+        target = clean_app_name(payload) or payload
+        _speak_during_act(automation_mcp.open_app, f"Opening {target}...", payload)
+        return
+    elif action_type == "open_website":
+        _speak_during_act(browser_mcp.open, f"Opening {payload}...", payload)
+        return
+    elif action_type == "search":
+        _speak_during_act(browser_mcp.search, f"Searching for {payload}...", payload)
+        return
+    elif action_type == "youtube":
+        _speak_during_act(browser_mcp.open_youtube, f"Opening YouTube for {payload}...", payload)
+        return
+    elif action_type == "spotify":
+        if payload:
+            _speak_during_act(browser_mcp.play_spotify, f"Playing {payload} on Spotify...", payload)
+        else:
+            # Try to resume if Spotify is open, otherwise open it
+            _speak_during_act(browser_mcp.play_spotify, "Opening Spotify...")
+        return
+    elif action_type == "spotify_random":
+        # Play random music based on time of day
+        _speak_during_act(browser_mcp.play_random_music, "Playing some music for you...")
+        return
+    elif action_type == "spotify_play":
+        _speak_during_act(browser_mcp.spotify_control, "Playing...", "play")
+        return
+    elif action_type == "spotify_pause":
+        _speak_during_act(browser_mcp.spotify_control, "Pausing...", "pause")
+        return
+    elif action_type == "spotify_next":
+        _speak_during_act(browser_mcp.spotify_control, "Next track...", "next")
+        return
+    elif action_type == "spotify_previous":
+        _speak_during_act(browser_mcp.spotify_control, "Previous track...", "previous")
+        return
+    elif action_type == "spotify_volume_up":
+        _speak_during_act(browser_mcp.spotify_control, "Volume up...", "volume_up")
+        return
+    elif action_type == "spotify_volume_down":
+        _speak_during_act(browser_mcp.spotify_control, "Volume down...", "volume_down")
+        return
+    elif action_type == "spotify_volume_set":
+        # Extract percentage from payload
+        try:
+            val = int(re.search(r'(\d{1,3})', payload).group(1))
+            _speak_during_act(browser_mcp.spotify_control, f"Setting volume to {val} percent...", "volume_set", val)
+        except (ValueError, AttributeError):
+            speak("What volume level would you like, sir?")
+        return
+    elif action_type == "spotify_volume_max":
+        _speak_during_act(browser_mcp.spotify_control, "Volume to maximum...", "volume_max")
+        return
+    elif action_type == "spotify_volume_min":
+        _speak_during_act(browser_mcp.spotify_control, "Volume to minimum...", "volume_min")
+        return
+    elif action_type == "spotify_mute":
+        _speak_during_act(browser_mcp.spotify_control, "Muting...", "mute")
+        return
+    elif action_type == "spotify_shuffle":
+        _speak_during_act(browser_mcp.spotify_control, "Toggling shuffle...", "shuffle")
+        return
+    elif action_type == "spotify_repeat":
+        _speak_during_act(browser_mcp.spotify_control, "Toggling repeat...", "repeat")
+        return
+    elif action_type == "gmail":
+        _speak_during_act(browser_mcp.open_gmail, "Opening Gmail...")
+        return
+    elif action_type == "maps":
+        _speak_during_act(browser_mcp.open_maps, "Opening Maps...")
+        return
+    elif action_type == "brightness":
+        _speak_during_act(automation_mcp.set_brightness, f"Setting brightness to {payload} percent.", int(payload))
+        return
+    elif action_type == "volume":
+        # The pattern only captures a number, so max/min arrive with an
+        # empty payload. Normalise before the int() conversion.
+        level = (payload or "").strip()
+        if not level:
+            level = "100" if re.search(r"\b(max|maximum|full|loudest)\b", cmd) else "0"
+        try:
+            value = max(0, min(100, int(level)))
+        except ValueError:
+            speak("What volume level would you like, sir?", )
+            return
+        _speak_during_act(automation_mcp.set_volume, f"Setting volume to {value} percent.", value)
+        return
+    elif action_type == "volume_mute":
+        _speak_during_act(automation_mcp.set_volume, "Muting system volume.", 0)
+        return
+    elif action_type == "volume_unmute":
+        _speak_during_act(automation_mcp.set_volume, "Restoring system volume.", 50)
+        return
+    elif action_type == "execute":
+        _speak_during_act(automation_mcp.execute_command, f"Executing {payload}...", payload)
+        return
+    elif action_type == "remember":
+        _speak_during_act(memory_mcp.remember, f"Remembering: {payload}", payload)
+        return
+    elif action_type == "recall":
+        _speak_during_act(memory_mcp.recall, f"Recalling: {payload}", payload)
+        return
+    elif action_type == "add_task":
+        _task_action(tasks_mcp.add_task, f"Adding task: {payload}", payload)
+        return
+    elif action_type == "complete_task":
+        _task_action(tasks_mcp.complete_task, f"Marking task {payload} as complete.", int(payload))
+        return
+    elif action_type == "delete_task":
+        _task_action(tasks_mcp.delete_task, f"Deleting task {payload}.", int(payload))
+        return
+    elif action_type == "delete_multiple_tasks":
+        _task_action(tasks_mcp.delete_multiple_tasks, f"Deleting tasks {payload}.", payload)
+        return
+    elif action_type == "clear_all_tasks":
+        _task_action(tasks_mcp.clear_all_tasks, "Clearing all tasks...")
+        return
+    elif action_type == "delete_task_by_desc":
+        _task_action(tasks_mcp.delete_task_by_description, f"Deleting task {payload}...", payload)
+        return
+    elif action_type == "list_tasks":
+        _task_action(tasks_mcp.list_tasks, "Here are your tasks.")
+        return
+    elif action_type == "clear_tasks":
+        _task_action(tasks_mcp.clear_done_tasks, "Clearing completed tasks.")
+        return
+    elif action_type == "system_info":
+        _speak_during_act(system_mcp.get_system_info, "Checking system status...")
+        return
+    elif action_type == "cpu_info":
+        _speak_during_act(system_mcp.handle, "Checking CPU...", "cpu", "")
+        return
+    elif action_type == "ram_info":
+        _speak_during_act(system_mcp.handle, "Checking memory...", "ram", "")
+        return
+    elif action_type == "battery_info":
+        _speak_during_act(system_mcp.handle, "Checking battery...", "battery", "")
+        return
+    elif action_type == "disk_info":
+        _speak_during_act(system_mcp.handle, "Checking disk...", "disk", "")
+        return
+    elif action_type == "network_info":
+        _speak_during_act(system_mcp.handle, "Checking network...", "network", "")
+        return
+    elif action_type == "running_apps":
+        _speak_during_act(system_mcp.get_running_apps, "Checking running apps...")
+        return
+    elif action_type == "find_file":
+        _speak_during_act(files_mcp.find_file, f"Searching for file {payload}...", payload)
+        return
+    elif action_type == "open_file":
+        _speak_during_act(files_mcp.open_file, f"Opening file {payload}...", payload)
+        return
+    elif action_type == "open_folder":
+        _speak_during_act(files_mcp.open_folder, f"Opening folder {payload}...", payload)
+        return
+    elif action_type == "recent_files":
+        _speak_during_act(files_mcp.list_recent_files, "Here are your recent files.")
+        return
+    # File operations
+    elif action_type == "create_file":
+        _speak_during_act(automation_mcp.create_file, f"Creating file {payload}...", payload)
+        return
+    elif action_type == "read_file":
+        _speak_during_act(automation_mcp.read_file, f"Reading file {payload}...", payload)
+        return
+    elif action_type == "delete_file":
+        _speak_during_act(automation_mcp.delete_file, f"Deleting file {payload}...", payload)
+        return
+    elif action_type == "copy_file":
+        parts = payload.split(" to ", 1)
+        if len(parts) == 2:
+            _speak_during_act(automation_mcp.copy_file, f"Copying {parts[0].strip()}...", parts[0].strip(), parts[1].strip())
+        else:
+            speak("Please specify source and destination, sir.")
+        return
+    elif action_type == "move_file":
+        parts = payload.split(" to ", 1)
+        if len(parts) == 2:
+            _speak_during_act(automation_mcp.move_file, f"Moving {parts[0].strip()}...", parts[0].strip(), parts[1].strip())
+        else:
+            speak("Please specify source and destination, sir.")
+        return
+    elif action_type == "list_directory":
+        path = payload if payload else "."
+        _speak_during_act(automation_mcp.list_directory, f"Listing {path}.", path)
+        return
+    # Window management
+    elif action_type == "minimize_window":
+        _speak_during_act(automation_mcp.minimize_window, "Minimizing window...")
+        return
+    elif action_type == "maximize_window":
+        _speak_during_act(automation_mcp.maximize_window, "Maximizing window...")
+        return
+    elif action_type == "close_window":
+        _speak_during_act(automation_mcp.close_window, "Closing window...")
+        return
+    elif action_type == "close_app":
+        target = clean_app_name(payload) or payload
+        _speak_during_act(automation_mcp.close_app, f"Closing {target}...", payload)
+        return
+    elif action_type == "close_tab":
+        def _close_tab():
+            import pyautogui
+            pyautogui.hotkey('ctrl', 'w')
+        threading.Thread(target=_close_tab, daemon=True).start()
+        speak("Closing tab, sir.")
+        return
+    elif action_type == "focus_window":
+        _speak_during_act(automation_mcp.focus_window, f"Focusing {payload}...", payload)
+        return
+    elif action_type == "list_windows":
+        _speak_during_act(automation_mcp.list_windows, "Here are the open windows...")
+        return
+    # Process management
+    elif action_type == "kill_process":
+        _speak_during_act(automation_mcp.kill_process, f"Killing {payload}...", payload)
+        return
+    elif action_type == "list_processes":
+        _speak_during_act(automation_mcp.list_processes, "Here are the running processes...")
+        return
+    # Screenshot
+    elif action_type == "take_screenshot":
+        _speak_during_act(automation_mcp.take_screenshot, "Taking screenshot...")
+        return
+    elif action_type == "delete_screenshots":
+        _speak_during_act(automation_mcp.delete_screenshots, "Deleting screenshots...")
+        return
+    elif action_type == "delete_last_screenshot":
+        _speak_during_act(automation_mcp.delete_last_screenshot, "Deleting last screenshot...")
+        return
+    # Clipboard
+    elif action_type == "get_clipboard":
+        _speak_during_act(automation_mcp.get_clipboard, "Reading clipboard...")
+        return
+    elif action_type == "set_clipboard":
+        _speak_during_act(automation_mcp.set_clipboard, f"Copied to clipboard: {payload}", payload)
+        return
+    # System commands
+    elif action_type == "shutdown_pc":
+        _speak_during_act(automation_mcp.shutdown_pc, "Shutting down...")
+        return
+    elif action_type == "restart_pc":
+        _speak_during_act(automation_mcp.restart_pc, "Restarting...")
+        return
+    elif action_type == "cancel_shutdown":
+        _speak_during_act(automation_mcp.cancel_shutdown, "Cancelling shutdown...")
+        return
+    elif action_type == "lock_pc":
+        _speak_during_act(automation_mcp.lock_pc, "Locking computer...")
+        return
+    elif action_type == "sleep_pc":
+        _speak_during_act(automation_mcp.sleep_pc, "Going to sleep...")
+        return
+    elif action_type == "hibernate_pc":
+        _speak_during_act(automation_mcp.hibernate_pc, "Hibernating...")
+        return
+    # Mouse/Keyboard
+    elif action_type == "mouse_click":
+        try:
+            nums = re.findall(r'\d+', payload)
+            x, y = int(nums[0]), int(nums[1])
+            _speak_during_act(automation_mcp.mouse_click, f"Clicking at {x}, {y}...", x, y)
+        except (ValueError, IndexError):
+            speak("Please specify coordinates like 500, 300, sir.")
+        return
+    elif action_type == "mouse_move":
+        try:
+            nums = re.findall(r'\d+', payload)
+            x, y = int(nums[0]), int(nums[1])
+            _speak_during_act(automation_mcp.mouse_move, f"Moving mouse to {x}, {y}...", x, y)
+        except (ValueError, IndexError):
+            speak("Please specify coordinates like 500, 300, sir.")
+        return
+    elif action_type == "type_text":
+        # Check if payload has "in [app]" format
+        parts = payload.rsplit(" in ", 1)
+        text = parts[0].strip()
+        app = parts[1].strip() if len(parts) > 1 else None
+        
+        def _type_in_app():
+            import time
+            # Open app first if specified
+            if app:
+                try:
+                    import win32gui
+                    hwnd = win32gui.GetForegroundWindow()
+                    title = win32gui.GetWindowText(hwnd).lower()
+                    if app.lower() not in title:
                         automation_mcp.open_app(app)
                         time.sleep(1.5)
-                automation_mcp.type_text(text)
-            threading.Thread(target=_type_in_app, daemon=True).start()
-            if app:
-                speak(f"Typing in {app}: {text}")
-            else:
-                speak(f"Typing: {text}")
-            return
-        elif action_type == "press_key":
-            _speak_during_act(automation_mcp.press_key, f"Pressing {payload}...", payload)
-            return
-        elif action_type == "hotkey":
-            _speak_during_act(automation_mcp.hotkey, f"Pressing {payload}...", payload)
-            return
-        elif action_type == "set_reminder":
-            _speak_during_act(reminders_mcp.set_reminder, f"Setting reminder: {payload}", payload)
-            return
-        elif action_type == "set_alarm":
-            _speak_during_act(reminders_mcp.set_alarm, f"Setting alarm for {payload}.", payload)
-            return
-        elif action_type == "set_timer":
-            _speak_during_act(reminders_mcp.set_timer, f"Setting timer for {payload}.", payload)
-            return
-        elif action_type == "list_reminders":
-            _speak_during_act(reminders_mcp.list_reminders, "Here are your reminders.")
-            return
-        elif action_type == "clear_reminders":
-            _speak_during_act(reminders_mcp.clear_all_reminders, "Clearing all reminders.")
-            return
-        elif action_type == "voice_status":
-            _speak_during_act(voice_mcp.handle, "Checking voice status.", "voice status", "")
-            return
-        elif action_type == "voice_mute":
-            _speak_during_act(voice_mcp.handle, "Voice muted.", "voice mute", "")
-            return
-        elif action_type == "voice_unmute":
-            _speak_during_act(voice_mcp.handle, "Voice unmuted.", "voice unmute", "")
-            return
-        elif action_type == "voice_backend":
-            _speak_during_act(voice_mcp.handle, "Checking voice backend.", "voice backend", payload)
-            return
-        elif action_type == "list_voices":
-            _speak_during_act(voice_mcp.handle, "Listing available voices.", "list voices", "")
-            return
-        elif action_type == "set_voice":
-            _speak_during_act(voice_mcp.handle, f"Setting voice to {payload}.", "set voice", payload)
-            return
-        elif action_type == "fix_error":
-            _handle_fix_error(cmd)
-            return
-
-        # --- Self-evolution. A review is slow (it runs the tests), so it goes
-        # --- to the background; everything else answers straight away.
-        elif action_type == "self_review":
-            threading.Thread(target=_handle_self_review, daemon=True).start()
-            speak("I will look myself over, sir.")
-            return
-        elif action_type == "evolve":
-            threading.Thread(target=_handle_evolve, daemon=True).start()
-            speak("I will review myself and bring you something to approve, sir.")
-            return
-        elif action_type == "evolution_status":
-            speak(evolution_mcp.handle("evolution status", payload) or "")
-            return
-        elif action_type == "show_proposals":
-            speak(evolution_mcp.handle("show proposals", payload) or "")
-            return
-        elif action_type == "approve_evolution":
-            speak(evolution_mcp.handle("approve evolution", payload) or "")
-            return
-        elif action_type == "reject_evolution":
-            speak(evolution_mcp.handle("reject evolution", payload) or "")
-            return
-        elif action_type == "revert_evolution":
-            speak(evolution_mcp.handle("revert evolution", payload) or "")
-            return
-        elif action_type == "run_skill":
-            threading.Thread(target=_handle_run_skill, args=(payload,), daemon=True).start()
-            return
-        elif action_type == "list_skills":
-            skills = skill_manager.list_skills()
-            if not skills:
-                speak("No custom skills are currently installed, sir.")
-            else:
-                names = ", ".join(s["name"] for s in skills)
-                speak(f"I have {len(skills)} skills available, sir: {names}.")
-            return
-
-        # Network-dependent - non-blocking
-        elif action_type == "weather":
-            threading.Thread(target=_fetch_and_respond, args=("weather", payload), daemon=True).start()
-            return
-        elif action_type == "news":
-            threading.Thread(target=_fetch_and_respond, args=("news", payload), daemon=True).start()
-            return
-        elif action_type == "tech_news":
-            threading.Thread(target=_fetch_and_respond, args=("tech_news", payload), daemon=True).start()
-            return
-        elif action_type == "sports_news":
-            threading.Thread(target=_fetch_and_respond, args=("sports_news", payload), daemon=True).start()
-            return
+                except Exception:
+                    automation_mcp.open_app(app)
+                    time.sleep(1.5)
+            automation_mcp.type_text(text)
+        threading.Thread(target=_type_in_app, daemon=True).start()
+        if app:
+            speak(f"Typing in {app}: {text}")
         else:
-            threading.Thread(target=_speak_stream_broadcast, args=(_ask_llm_stream, cmd, memory), daemon=True).start()
-            return
+            speak(f"Typing: {text}")
+        return
+    elif action_type == "press_key":
+        _speak_during_act(automation_mcp.press_key, f"Pressing {payload}...", payload)
+        return
+    elif action_type == "hotkey":
+        _speak_during_act(automation_mcp.hotkey, f"Pressing {payload}...", payload)
+        return
+    elif action_type == "set_reminder":
+        _speak_during_act(reminders_mcp.set_reminder, f"Setting reminder: {payload}", payload)
+        return
+    elif action_type == "set_alarm":
+        _speak_during_act(reminders_mcp.set_alarm, f"Setting alarm for {payload}.", payload)
+        return
+    elif action_type == "set_timer":
+        _speak_during_act(reminders_mcp.set_timer, f"Setting timer for {payload}.", payload)
+        return
+    elif action_type == "list_reminders":
+        _speak_during_act(reminders_mcp.list_reminders, "Here are your reminders.")
+        return
+    elif action_type == "clear_reminders":
+        _speak_during_act(reminders_mcp.clear_all_reminders, "Clearing all reminders.")
+        return
+    elif action_type == "voice_status":
+        _speak_during_act(voice_mcp.handle, "Checking voice status.", "voice status", "")
+        return
+    elif action_type == "voice_mute":
+        _speak_during_act(voice_mcp.handle, "Voice muted.", "voice mute", "")
+        return
+    elif action_type == "voice_unmute":
+        _speak_during_act(voice_mcp.handle, "Voice unmuted.", "voice unmute", "")
+        return
+    elif action_type == "voice_backend":
+        _speak_during_act(voice_mcp.handle, "Checking voice backend.", "voice backend", payload)
+        return
+    elif action_type == "list_voices":
+        _speak_during_act(voice_mcp.handle, "Listing available voices.", "list voices", "")
+        return
+    elif action_type == "set_voice":
+        _speak_during_act(voice_mcp.handle, f"Setting voice to {payload}.", "set voice", payload)
+        return
+    elif action_type == "fix_error":
+        _handle_fix_error(cmd)
+        return
+
+    # --- Self-evolution. A review is slow (it runs the tests), so it goes
+    # --- to the background; everything else answers straight away.
+    elif action_type == "self_review":
+        threading.Thread(target=_handle_self_review, daemon=True).start()
+        speak("I will look myself over, sir.")
+        return
+    elif action_type == "evolve":
+        threading.Thread(target=_handle_evolve, daemon=True).start()
+        speak("I will review myself and bring you something to approve, sir.")
+        return
+    elif action_type == "evolution_status":
+        speak(evolution_mcp.handle("evolution status", payload) or "")
+        return
+    elif action_type == "show_proposals":
+        speak(evolution_mcp.handle("show proposals", payload) or "")
+        return
+    elif action_type == "approve_evolution":
+        speak(evolution_mcp.handle("approve evolution", payload) or "")
+        return
+    elif action_type == "reject_evolution":
+        speak(evolution_mcp.handle("reject evolution", payload) or "")
+        return
+    elif action_type == "revert_evolution":
+        speak(evolution_mcp.handle("revert evolution", payload) or "")
+        return
+    elif action_type == "run_skill":
+        threading.Thread(target=_handle_run_skill, args=(payload,), daemon=True).start()
+        return
+    elif action_type == "list_skills":
+        skills = skill_manager.list_skills()
+        if not skills:
+            speak("No custom skills are currently installed, sir.")
+        else:
+            names = ", ".join(s["name"] for s in skills)
+            speak(f"I have {len(skills)} skills available, sir: {names}.")
+        return
+
+    # Network-dependent - non-blocking
+    elif action_type == "weather":
+        threading.Thread(target=_fetch_and_respond, args=("weather", payload), daemon=True).start()
+        return
+    elif action_type == "news":
+        threading.Thread(target=_fetch_and_respond, args=("news", payload), daemon=True).start()
+        return
+    elif action_type == "tech_news":
+        threading.Thread(target=_fetch_and_respond, args=("tech_news", payload), daemon=True).start()
+        return
+    elif action_type == "sports_news":
+        threading.Thread(target=_fetch_and_respond, args=("sports_news", payload), daemon=True).start()
+        return
     else:
         threading.Thread(target=_speak_stream_broadcast, args=(_ask_llm_stream, cmd, memory), daemon=True).start()
         return
